@@ -1,0 +1,32 @@
+# Speed up Modal image uploads by excluding local-only files/artifacts.
+
+# Python envs and caches
+venv/
+**/__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# VCS
+.git/
+.gitignore
+
+# OS/editor junk
+.DS_Store
+*.swp
+*.swo
+
+# Large local datasets and artifacts (stored in Modal Volumes instead)
+training/
+data/
+models/
+
+# Logs and checkpoints
+*.log
+*.ckpt
+*.pt
+*.bin
+
+# Modal metadata (keep app file, ignore build leftovers if any)
+.modal/**
+
