@@ -137,10 +137,10 @@ Prerequisites:
 
 Quick start (baseline model):
 - Create a Volume for raw training texts and upload files:
-  - `modal volume create writing7-training2`
-  - `modal volume put writing7-training2 training`
+  - `modal volume create writing7-training`
+  - `modal volume put writing7-training training`
 - Prepare datasets from the training Volume:
-  - `modal run modal_app.py::prepare`  # reads from /input/training (writing7-training2)
+  - `modal run modal_app.py::prepare`  # reads from /input/training (writing7-training)
 - Train on CPU:
   - `modal run modal_app.py::train -- --model roberta-base --epochs 3`
 - Train on GPU (recommended):

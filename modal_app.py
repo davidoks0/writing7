@@ -22,7 +22,7 @@ import modal
 
 APP_NAME = "writing7"
 ARTIFACT_VOL_NAME = "writing7-artifacts"
-TRAINING_VOL_NAME = "writing7-training2"
+TRAINING_VOL_NAME = "writing7-training"
 
 app = modal.App(APP_NAME)
 artifacts_vol = modal.Volume.from_name(ARTIFACT_VOL_NAME, create_if_missing=True)
@@ -32,7 +32,11 @@ training_vol = modal.Volume.from_name(TRAINING_VOL_NAME, create_if_missing=True)
 # Images
 image_cpu = (
     modal.Image.debian_slim()
-    .pip_install_from_requirements("requirements.txt")
+    .apt_install("curl", "ca-certificates")
+    .add_local_file("requirements.txt", "/workspace/requirements.txt", copy=True)
+    .run_commands("curl -LsSf https://astral.sh/uv/install.sh | sh")
+    .run_commands("ln -sf /root/.local/bin/uv /usr/local/bin/uv")
+    .run_commands("uv pip install --system -r /workspace/requirements.txt")
     .run_commands("python -m spacy download en_core_web_sm || true")
     .add_local_dir("eval", "/workspace/eval")
     .add_local_file("standardize_training.py", "/workspace/standardize_training.py")
@@ -50,12 +54,16 @@ image_cpu = (
 
 image_gpu = (
     modal.Image.debian_slim()
-    # Install base requirements first
-    .pip_install_from_requirements("requirements.txt")
-    # Then override torch with CUDA wheels from PyTorch index
+    .apt_install("curl", "ca-certificates")
+    .add_local_file("requirements.txt", "/workspace/requirements.txt", copy=True)
+    # Install uv and CUDA-enabled torch first (avoids downloading CPU torch)
+    .run_commands("curl -LsSf https://astral.sh/uv/install.sh | sh")
+    .run_commands("ln -sf /root/.local/bin/uv /usr/local/bin/uv")
     .run_commands(
-        "python -m pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu121 torch==2.5.1+cu121"
+        "uv pip install --system --index-url https://download.pytorch.org/whl/cu121 torch==2.5.1+cu121"
     )
+    # Then the rest of requirements (keeps existing torch)
+    .run_commands("uv pip install --system -r /workspace/requirements.txt")
     .run_commands("python -m spacy download en_core_web_sm || true")
     .add_local_dir("eval", "/workspace/eval")
     .add_local_file("standardize_training.py", "/workspace/standardize_training.py")
@@ -71,20 +79,29 @@ image_gpu = (
     .add_local_file("style_map.py", "/workspace/style_map.py")
 )
 
+# Lightweight data image for I/O and mirroring tools
+image_data = (
+    modal.Image.debian_slim()
+    .pip_install("httpx")
+    .apt_install("rsync", "curl")
+    .add_local_file("standardize_training.py", "/workspace/standardize_training.py")
+)
+
 
 def _ensure_dirs():
     os.makedirs("/vol/data/processed", exist_ok=True)
     os.makedirs("/vol/models/book_matcher", exist_ok=True)
     os.makedirs("/vol/models/book_matcher_contrastive", exist_ok=True)
     os.makedirs("/vol/hf", exist_ok=True)
+    os.makedirs("/vol/tmp/prepare_shards", exist_ok=True)
 
 
 COMMON_ENV = {
     "HF_HOME": "/vol/hf",
     "TRANSFORMERS_NO_ADVISORY_WARNINGS": "1",
     "TOKENIZERS_PARALLELISM": "false",
-    # Reduce CUDA fragmentation per PyTorch docs when VRAM is tight
-    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+    # Reduce CUDA fragmentation per PyTorch docs when VRAM is tight (PyTorch>=2.4)
+    "PYTORCH_ALLOC_CONF": "expandable_segments:True",
 }
 
 
@@ -222,6 +239,7 @@ def prepare_remote(
     volumes={"/vol": artifacts_vol, "/input": training_vol},
     secrets=[],
     gpu="H200",
+    cpu=8,
     timeout=60 * 60 * 4,
     env={**COMMON_ENV, "PYTHONPATH": "/workspace"},
 )
@@ -344,6 +362,379 @@ def prepare_remote_gpu(
     print(f"Saved datasets to {out_dir}")
 
 
+# --------------------- Sharded prepare across containers ---------------------
+@app.function(
+    image=image_cpu,
+    volumes={"/vol": artifacts_vol, "/input": training_vol},
+    secrets=[],
+    timeout=60 * 60 * 3,
+    cpu=8,
+    memory=16384,
+    max_containers=100,
+    env={**COMMON_ENV, "PYTHONPATH": "/workspace"},
+)
+def prepare_chunk_shard_remote(
+    base_dir: str = "/input/training",
+    rel_paths: list[str] | None = None,
+    shard_index: int = 0,
+    out_dir: str = "/vol/tmp/prepare_shards",
+    chunk_size: int = 14,
+    overlap: int = 4,
+    max_chunks_per_book: int = 800,
+    use_hard_negatives: bool = True,
+    workers: int | None = 8,
+):
+    """Process a subset of books and write a shard JSONL to the volume."""
+    from pathlib import Path as _Path
+    from prepare_data import chunk_books_to_jsonl
+
+    _ensure_dirs()
+    bdir = _Path(base_dir)
+    files = rel_paths or []
+    out_path = _Path(out_dir) / f"shard_{int(shard_index):04d}.jsonl"
+    print({
+        "shard": int(shard_index),
+        "base_dir": str(bdir),
+        "files": len(files),
+        "out": str(out_path),
+    })
+    stats = chunk_books_to_jsonl(
+        base_dir=bdir,
+        rel_paths=[str(p) for p in files],
+        out_jsonl=out_path,
+        chunk_size=int(chunk_size),
+        overlap=int(overlap),
+        max_chunks_per_book=int(max_chunks_per_book),
+        use_hard_negatives=bool(use_hard_negatives),
+        workers=(None if workers is None else int(workers)),
+    )
+    print({"shard": int(shard_index), **stats})
+    return {"ok": True, **stats, "out": str(out_path)}
+
+
+@app.function(
+    image=image_gpu,
+    volumes={"/vol": artifacts_vol, "/input": training_vol},
+    secrets=[],
+    gpu="H200",
+    timeout=60 * 60 * 4,
+    cpu=8,
+    env={**COMMON_ENV, "PYTHONPATH": "/workspace"},
+)
+def prepare_merge_shards_remote_gpu(
+    shards_dir: str = "/vol/tmp/prepare_shards",
+    expected_shards: int | None = None,
+    wait_timeout_s: int = 60 * 60 * 2,
+    poll_interval_s: int = 10,
+    manifest_path: str | None = None,
+    # Build params (subset of prepare_remote_gpu)
+    train_ratio: float = 0.7,
+    val_ratio: float = 0.15,
+    use_hard_negatives: bool = True,
+    use_embedding_hard_negatives: bool = True,
+    embedding_model: str = 'sentence-transformers/all-MiniLM-L6-v2',
+    num_chunks_for_embed: int = 80,
+    num_hard_negative_books: int = 50,
+    n_positive_per_book: int = 20,
+    n_negative_per_book: int = 40,
+    # Optional advanced miners off by default for merge step
+    use_model_mined_negatives: bool = False,
+):
+    """Wait for shard JSONLs, merge them, and finish dataset build on GPU."""
+    import time as _time
+    from pathlib import Path as _Path
+    from prepare_data import load_shards_jsonl, prepare_datasets_from_prechunked
+
+    _ensure_dirs()
+    sdir = _Path(shards_dir)
+    sdir.mkdir(parents=True, exist_ok=True)
+
+    # Wait until all expected shards exist (if provided)
+    start = _time.time()
+    shards = []
+    manifest_files = []
+    if manifest_path:
+        mp = _Path(manifest_path)
+        if mp.exists():
+            try:
+                import json as _json
+                data = _json.loads(mp.read_text(encoding='utf-8'))
+                shard_list = [ _Path(p) for p in data.get('shards', []) ]
+                manifest_files = [str(p) for p in shard_list]
+                # Poll until all shards in manifest exist or timeout
+                while True:
+                    ready = [p for p in shard_list if p.exists()]
+                    if len(ready) >= len(shard_list):
+                        shards = ready
+                        break
+                    if (_time.time() - start) > wait_timeout_s:
+                        print({
+                            "warning": "wait_timeout exceeded while waiting for manifest shards",
+                            "expected": len(shard_list),
+                            "found": len(ready),
+                        })
+                        shards = ready
+                        break
+                    _time.sleep(max(1, int(poll_interval_s)))
+            except Exception as e:
+                print({"warning": f"manifest read failed: {e}", "manifest_path": str(mp)})
+
+    if not shards:
+        if expected_shards is not None and expected_shards > 0:
+            while True:
+                shards = sorted(p for p in sdir.glob("shard_*.jsonl") if p.is_file())
+                if len(shards) >= int(expected_shards):
+                    break
+                if (_time.time() - start) > wait_timeout_s:
+                    print({
+                        "warning": "wait_timeout exceeded while waiting for shards",
+                        "expected": int(expected_shards),
+                        "found": len(shards),
+                    })
+                    break
+                _time.sleep(max(1, int(poll_interval_s)))
+        shards = shards or sorted(p for p in sdir.glob("shard_*.jsonl") if p.is_file())
+
+    print({"shards_found": len(shards), "from_manifest": bool(manifest_files)})
+    if not shards:
+        raise RuntimeError("No shard files found; cannot merge.")
+
+    book_chunks, book_metadata = load_shards_jsonl(shards)
+    print({"books": len(book_chunks)})
+    datasets = prepare_datasets_from_prechunked(
+        book_chunks=book_chunks,
+        book_metadata=book_metadata,
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+        use_hard_negatives=use_hard_negatives,
+        use_embedding_hard_negatives=use_embedding_hard_negatives,
+        embedding_model=embedding_model,
+        num_chunks_for_embed=num_chunks_for_embed,
+        num_hard_negative_books=num_hard_negative_books,
+        n_positive_per_book=n_positive_per_book,
+        n_negative_per_book=n_negative_per_book,
+        use_model_mined_negatives=use_model_mined_negatives,
+    )
+    out_dir = "/vol/data/processed"
+    datasets.save_to_disk(out_dir)
+    print({"merged_saved_to": out_dir})
+    return {"ok": True, "books": len(book_chunks), "shards": len(shards), "out": out_dir, "manifest": manifest_files}
+
+
+@app.function(
+    image=image_cpu,
+    volumes={"/vol": artifacts_vol, "/input": training_vol},
+    secrets=[],
+    timeout=60 * 60 * 8,
+    cpu=8,
+    memory=16384,
+    env={**COMMON_ENV, "PYTHONPATH": "/workspace"},
+)
+def prepare_sharded_remote(
+    training_dir: str = "/input/training",
+    # Sharding controls
+    containers: int = 100,
+    per_container_workers: int = 8,
+    # Pre-standardize all texts (slow). Default off; shard step cleans per file anyway.
+    standardize: bool = False,
+    # Chunking params
+    chunk_size: int = 14,
+    overlap: int = 4,
+    max_chunks_per_book: int = 800,
+    use_hard_negatives: bool = True,
+    # Merge/build params
+    train_ratio: float = 0.7,
+    val_ratio: float = 0.15,
+    use_embedding_hard_negatives: bool = True,
+    embedding_model: str = 'sentence-transformers/all-MiniLM-L6-v2',
+    num_chunks_for_embed: int = 80,
+    num_hard_negative_books: int = 50,
+    n_positive_per_book: int = 20,
+    n_negative_per_book: int = 40,
+    # Wait controls
+    shard_wait_timeout_s: int = 60 * 60 * 2,
+):
+    """Sharded prepare: CPU chunking across containers + GPU merge/build.
+
+    Writes shard JSONLs to /vol/tmp/prepare_shards and then completes on GPU.
+    """
+    from pathlib import Path as _Path
+    import math as _math
+    import os as _os
+
+    _ensure_dirs()
+
+    base_dir = str(training_dir)
+    if standardize:
+        # Optional: Pre-standardize into /input/training_clean. Note this is slow and typically unnecessary
+        # because shard workers load and clean text before chunking.
+        try:
+            from standardize_training import clean_text as _clean_text
+            src_dir = _Path(training_dir)
+            dst_dir = _Path("/input/training_clean")
+            dst_dir.mkdir(parents=True, exist_ok=True)
+            files = sorted(src_dir.rglob('*.txt'))
+            cleaned = 0
+            for src in files:
+                rel = src.relative_to(src_dir)
+                dst = dst_dir / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    raw = src.read_text(encoding='utf-8', errors='ignore')
+                    txt = _clean_text(raw)
+                    dst.write_text(txt, encoding='utf-8')
+                    cleaned += 1
+                except Exception:
+                    import shutil as _sh
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    _sh.copy2(src, dst)
+            print({"standardized": cleaned, "total": len(files)})
+            base_dir = str(dst_dir)
+        except Exception as e:
+            print({"standardize_error": str(e)})
+
+    # Enumerate files and build shards
+    bdir = _Path(base_dir)
+    all_files = sorted([p for p in bdir.rglob('*.txt') if p.is_file()])
+    total = len(all_files)
+    if total == 0:
+        raise RuntimeError(f"No .txt files found under {base_dir}")
+    # Relativize paths for portability
+    rels = [str(p.relative_to(bdir)) for p in all_files]
+    # Bound containers to [1, 100]
+    k = int(max(1, min(int(containers), 100)))
+    if k > total:
+        k = total
+    # Clean shard dir
+    sdir = _Path("/vol/tmp/prepare_shards")
+    sdir.mkdir(parents=True, exist_ok=True)
+    for old in sdir.glob("shard_*.jsonl"):
+        try:
+            old.unlink()
+        except Exception:
+            pass
+    per = int(_math.ceil(total / float(k)))
+    print({"total_files": total, "containers": k, "per_container": per})
+
+    # Dispatch shard jobs concurrently
+    calls = []
+    for i in range(k):
+        start = i * per
+        end = min(total, start + per)
+        if start >= end:
+            break
+        sub = rels[start:end]
+        c = prepare_chunk_shard_remote.spawn(
+            base_dir=base_dir,
+            rel_paths=sub,
+            shard_index=i,
+            out_dir=str(sdir),
+            chunk_size=chunk_size,
+            overlap=overlap,
+            max_chunks_per_book=max_chunks_per_book,
+            use_hard_negatives=use_hard_negatives,
+            workers=per_container_workers,
+        )
+        calls.append(c)
+
+    # Block on shard tasks to guarantee files are written before merge
+    completed, failed = 0, 0
+    results = []
+    for idx, call in enumerate(calls):
+        try:
+            res = call.get(timeout=60 * 60 * 3)  # up to 3h per shard batch
+            # Minimal logging to aid debugging
+            try:
+                print({"shard_done": idx, "books": int(res.get("books", 0)), "chunks": int(res.get("chunks", 0))})
+            except Exception:
+                pass
+            completed += 1
+            results.append(res)
+        except Exception as e:
+            print({"shard_error": idx, "error": str(e)})
+            failed += 1
+
+    # Compute how many shard files actually exist (best-effort; volumes may show updates on new mount)
+    actual_shards = len(list(sdir.glob("shard_*.jsonl")))
+    print({
+        "shard_calls": len(calls),
+        "completed": completed,
+        "failed": failed,
+        "files_found": actual_shards,
+        "note": "files_found may be 0 in this container; GPU merge reads via fresh mount/manifest",
+    })
+
+    # Prefer using number of completed shard tasks as the expected count; the GPU merge will also wait/poll
+    expected = completed if completed > 0 else None
+
+    # Write a manifest listing shard file paths for the GPU merge to follow
+    manifest_path = sdir / "shards_manifest.json"
+    try:
+        import json as _json
+        shard_paths = [r.get("out") for r in results if r and r.get("out")]
+        data = {"expected": completed, "shards": shard_paths}
+        manifest_path.write_text(_json.dumps(data), encoding='utf-8')
+        print({"manifest_written": str(manifest_path), "shards": len(shard_paths)})
+    except Exception as e:
+        print({"manifest_write_error": str(e)})
+
+    # Run GPU merge/build; it will wait for expected shards (via manifest or glob) to appear on a fresh mount
+    return prepare_merge_shards_remote_gpu.remote(
+        shards_dir=str(sdir),
+        expected_shards=expected,
+        manifest_path=str(manifest_path),
+        wait_timeout_s=int(shard_wait_timeout_s),
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+        use_hard_negatives=use_hard_negatives,
+        use_embedding_hard_negatives=use_embedding_hard_negatives,
+        embedding_model=embedding_model,
+        num_chunks_for_embed=num_chunks_for_embed,
+        num_hard_negative_books=num_hard_negative_books,
+        n_positive_per_book=n_positive_per_book,
+        n_negative_per_book=n_negative_per_book,
+        use_model_mined_negatives=False,
+    )
+
+
+# Local entrypoint to run sharded prepare from CLI
+@app.local_entrypoint()
+def prepare_sharded(
+    training_dir: str = "/input/training",
+    containers: int = 100,
+    per_container_workers: int = 8,
+    chunk_size: int = 14,
+    overlap: int = 4,
+    max_chunks_per_book: int = 800,
+    use_hard_negatives: bool = True,
+    train_ratio: float = 0.7,
+    val_ratio: float = 0.15,
+    use_embedding_hard_negatives: bool = True,
+    embedding_model: str = 'sentence-transformers/all-MiniLM-L6-v2',
+    num_chunks_for_embed: int = 80,
+    num_hard_negative_books: int = 50,
+    n_positive_per_book: int = 20,
+    n_negative_per_book: int = 40,
+):
+    return prepare_sharded_remote.remote(
+        training_dir=training_dir,
+        containers=containers,
+        per_container_workers=per_container_workers,
+        chunk_size=chunk_size,
+        overlap=overlap,
+        max_chunks_per_book=max_chunks_per_book,
+        use_hard_negatives=use_hard_negatives,
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+        use_embedding_hard_negatives=use_embedding_hard_negatives,
+        embedding_model=embedding_model,
+        num_chunks_for_embed=num_chunks_for_embed,
+        num_hard_negative_books=num_hard_negative_books,
+        n_positive_per_book=n_positive_per_book,
+        n_negative_per_book=n_negative_per_book,
+    )
+
+
 @app.function(
     image=image_cpu,
     volumes={"/vol": artifacts_vol, "/input": training_vol},
@@ -383,6 +774,7 @@ def train_remote(
     volumes={"/vol": artifacts_vol, "/input": training_vol},
     secrets=[],
     gpu="H200",
+    cpu=8,
     timeout=60 * 60 * 12,
     env={**COMMON_ENV, "PYTHONPATH": "/workspace"},
 )
@@ -752,6 +1144,7 @@ def calibrate_contrastive_remote(
     volumes={"/vol": artifacts_vol, "/input": training_vol},
     secrets=[],
     gpu="H200",
+    cpu=8,
     timeout=60 * 60,
     env={**COMMON_ENV, "PYTHONPATH": "/workspace"},
 )
@@ -762,9 +1155,9 @@ def calibrate_contrastive_remote_gpu(
     target_acc: float | None = None,
     target_recall: float | None = 0.85,
     save_to: str | None = None,
-    batch_size: int = 256,
+    batch_size: int = 512,
     num_proc: int = 4,
-    num_workers: int = 2,
+    num_workers: int = 4,
     max_length: int = 512,
 ):
     from calibrate_contrastive import calibrate_contrastive as _cal
@@ -901,6 +1294,31 @@ def style_similarity_remote_gpu(
     image=image_cpu,
     volumes={"/vol": artifacts_vol, "/input": training_vol},
     secrets=[],
+    timeout=60 * 5,
+    env={**COMMON_ENV, "PYTHONPATH": "/workspace"},
+)
+def count_training_texts_remote(training_dir: str = "/input/training"):
+    """Count .txt files under the training_dir inside the Modal volume (recursive)."""
+    from pathlib import Path as _Path
+    import os as _os
+    td = _Path(training_dir)
+    try:
+        n = len(list(td.rglob("*.txt")))
+    except Exception as e:
+        print({"error": str(e), "training_dir": str(td)})
+        n = 0
+    try:
+        listing = _os.listdir(str(td)) if td.exists() else []
+    except Exception:
+        listing = []
+    print({"training_dir": str(td), "exists": td.exists(), "top_level": listing[:10], "count": n})
+    return {"training_dir": str(td), "exists": td.exists(), "count": int(n)}
+
+
+@app.function(
+    image=image_cpu,
+    volumes={"/vol": artifacts_vol, "/input": training_vol},
+    secrets=[],
     timeout=60 * 45,
     env={**COMMON_ENV, "PYTHONPATH": "/workspace"},
 )
@@ -925,12 +1343,12 @@ def style_map_remote(
     book_topk: int = 5,
     use_projection: bool = False,
     # Optional cluster coloring and pruning
-    cluster_method: str = "none",
+    cluster_method: str = "kmeans",
     n_clusters: int = 12,
     hdbscan_min_cluster_size: int = 10,
     hdbscan_min_samples: int | None = None,
     drop_outliers: bool = False,
-    prune_top_pct: float = 0.0,
+    prune_top_pct: float = 0.02,
     prune_knn_k: int = 10,
     num_chunks = 'auto',
     chunk_size: int = 14,
@@ -939,8 +1357,12 @@ def style_map_remote(
     embed_batch_size: int = 64,
     auto_tune_embed_batch: bool = False,
     max_length: int = 384,
+    interactive_html: bool = True,
 ):
-    """Generate a 2D style map (CSV + PNG) for books under books_dir (CPU)."""
+    """Generate style maps (CSV/PNG + HTML) for books under books_dir (CPU).
+
+    Produces both 2D and 3D interactive HTML by default and colors by clusters.
+    """
     from pathlib import Path as _Path
     from inference_contrastive import ContrastiveBookMatcherInference
     from style_map import _prepare_book_chunks, embed_books_batched, reduce_to_nd, plot_map, cluster_and_prune
@@ -1013,6 +1435,7 @@ def style_map_remote(
         random_state=seed,
     )
 
+    # Save CSV/PNG/HTML for primary (n_components)
     out_csv = _Path(out_prefix).with_suffix(".csv")
     # Optional clusters in embedding space
     if clusters is None and cluster_method == "kmeans":
@@ -1051,6 +1474,77 @@ def style_map_remote(
     out_png = _Path(out_prefix).with_suffix(".png")
     if n_components == 2:
         plot_map(coords, labels, out_png, clusters=clusters)
+    # Optional interactive HTML (2D or 3D)
+    if interactive_html:
+        try:
+            import plotly.express as px
+            out_html = _Path(out_prefix).with_suffix(".html")
+            if n_components == 3:
+                fig = px.scatter_3d(x=coords[:,0], y=coords[:,1], z=coords[:,2], hover_name=labels, color=(clusters if clusters is not None else None), height=720, width=960)
+            else:
+                fig = px.scatter(x=coords[:,0], y=coords[:,1], hover_name=labels, color=(clusters if clusters is not None else None), height=720, width=960)
+            fig.update_traces(marker=dict(size=3))
+            fig.write_html(str(out_html), include_plotlyjs='cdn', full_html=True)
+        except Exception as e:
+            print(f"Interactive HTML export failed: {e}")
+
+    # Also produce the alternate dimensionality (both 2D and 3D by default)
+    try:
+        other_nc = 3 if int(n_components) == 2 else 2
+        coords_alt = reduce_to_nd(
+            X,
+            method=method,
+            n_components=other_nc,
+            pca_dim=pca_dim,
+            perplexity=perplexity,
+            n_neighbors=n_neighbors,
+            min_dist=min_dist,
+            metric=metric,
+            densmap=densmap,
+            random_state=seed,
+        )
+        alt_suffix = "_3d" if other_nc == 3 else "_2d"
+        alt_prefix = _Path(str(_Path(out_prefix)) + alt_suffix)
+        # CSV for alternate
+        out_csv_alt = alt_prefix.with_suffix(".csv")
+        with out_csv_alt.open("w", newline="", encoding="utf-8") as f:
+            w = _csv.writer(f)
+            if other_nc == 3:
+                cols = ["label", "x", "y", "z"]
+            else:
+                cols = ["label", "x", "y"]
+            if clusters is not None:
+                cols.append("cluster")
+            w.writerow(cols)
+            for i, lab in enumerate(labels):
+                if other_nc == 3:
+                    x, y, z = coords_alt[i,0], coords_alt[i,1], coords_alt[i,2]
+                    row = [lab, float(x), float(y), float(z)]
+                else:
+                    x, y = coords_alt[i,0], coords_alt[i,1]
+                    row = [lab, float(x), float(y)]
+                if clusters is not None:
+                    row.append(int(clusters[i]))
+                w.writerow(row)
+        # PNG only for 2D alt
+        if other_nc == 2:
+            out_png_alt = alt_prefix.with_suffix(".png")
+            plot_map(coords_alt, labels, out_png_alt, clusters=clusters)
+        # HTML for alternate
+        if interactive_html:
+            try:
+                import plotly.express as px
+                out_html_alt = alt_prefix.with_suffix(".html")
+                if other_nc == 3:
+                    fig = px.scatter_3d(x=coords_alt[:,0], y=coords_alt[:,1], z=coords_alt[:,2], hover_name=labels, color=(clusters if clusters is not None else None), height=720, width=960)
+                else:
+                    fig = px.scatter(x=coords_alt[:,0], y=coords_alt[:,1], hover_name=labels, color=(clusters if clusters is not None else None), height=720, width=960)
+                fig.update_traces(marker=dict(size=3))
+                fig.write_html(str(out_html_alt), include_plotlyjs='cdn', full_html=True)
+            except Exception as e:
+                print(f"Interactive HTML export (alt) failed: {e}")
+    except Exception as e:
+        print(f"Alternate dimensionality export failed: {e}")
 
     return {"status": "ok", "csv": str(out_csv), "png": str(out_png), "books": len(labels)}
 
@@ -1267,6 +1761,15 @@ def umap_sweep_remote_gpu(
 
     return {"status": "ok", "results": str(outp), "best": cfg_best, **best_files}
 
+@app.function(
+    image=image_gpu,
+    volumes={"/vol": artifacts_vol, "/input": training_vol},
+    secrets=[],
+    gpu="H200",
+    # Allow longer for large corpora
+    timeout=60 * 120,
+    env={**COMMON_ENV, "PYTHONPATH": "/workspace"},
+)
 def style_map_remote_gpu(
     model_dir: str = "/vol/models/book_matcher_contrastive/final",
     books_dir: str = "/input/training",
@@ -1288,13 +1791,13 @@ def style_map_remote_gpu(
     book_topk: int = 5,
     use_projection: bool = False,
     # Optional interactive export and cluster coloring
-    interactive_html: bool = False,
-    cluster_method: str = "none",
+    interactive_html: bool = True,
+    cluster_method: str = "kmeans",
     n_clusters: int = 12,
     hdbscan_min_cluster_size: int = 10,
     hdbscan_min_samples: int | None = None,
     drop_outliers: bool = False,
-    prune_top_pct: float = 0.0,
+    prune_top_pct: float = 0.02,
     prune_knn_k: int = 10,
     num_chunks = 'auto',
     chunk_size: int = 14,
@@ -1386,7 +1889,7 @@ def style_map_remote_gpu(
         random_state=seed,
     )
 
-    # Save CSV
+    # Save CSV/PNG/HTML for primary (n_components)
     out_csv = _Path(out_prefix).with_suffix(".csv")
     # Optional clusters in embedding space
     if clusters is None and cluster_method == "kmeans":
@@ -1440,6 +1943,65 @@ def style_map_remote_gpu(
         except Exception as e:
             print(f"Interactive HTML export failed: {e}")
 
+    # Also produce the alternate dimensionality (both 2D and 3D by default)
+    try:
+        other_nc = 3 if int(n_components) == 2 else 2
+        coords_alt = reduce_to_nd(
+            X,
+            method=method,
+            n_components=other_nc,
+            pca_dim=pca_dim,
+            perplexity=perplexity,
+            n_neighbors=n_neighbors,
+            min_dist=min_dist,
+            metric=metric,
+            densmap=densmap,
+            random_state=seed,
+        )
+        alt_suffix = "_3d" if other_nc == 3 else "_2d"
+        alt_prefix = _Path(str(_Path(out_prefix)) + alt_suffix)
+        # CSV for alternate
+        out_csv_alt = alt_prefix.with_suffix(".csv")
+        with out_csv_alt.open("w", newline="", encoding="utf-8") as f:
+            w = _csv.writer(f)
+            if other_nc == 3:
+                cols = ["label", "x", "y", "z"]
+            else:
+                cols = ["label", "x", "y"]
+            if clusters is not None:
+                cols.append("cluster")
+            w.writerow(cols)
+            for i, lab in enumerate(labels):
+                if other_nc == 3:
+                    x, y, z = coords_alt[i,0], coords_alt[i,1], coords_alt[i,2]
+                    row = [lab, float(x), float(y), float(z)]
+                else:
+                    x, y = coords_alt[i,0], coords_alt[i,1]
+                    row = [lab, float(x), float(y)]
+                if clusters is not None:
+                    row.append(int(clusters[i]))
+                w.writerow(row)
+        # PNG only for 2D alt
+        out_png_alt = None
+        if other_nc == 2:
+            out_png_alt = alt_prefix.with_suffix(".png")
+            plot_map(coords_alt, labels, out_png_alt, clusters=clusters)
+        # HTML for alternate
+        if interactive_html:
+            try:
+                import plotly.express as px
+                out_html_alt = alt_prefix.with_suffix(".html")
+                if other_nc == 3:
+                    fig = px.scatter_3d(x=coords_alt[:,0], y=coords_alt[:,1], z=coords_alt[:,2], hover_name=labels, color=(clusters if clusters is not None else None), height=720, width=960)
+                else:
+                    fig = px.scatter(x=coords_alt[:,0], y=coords_alt[:,1], hover_name=labels, color=(clusters if clusters is not None else None), height=720, width=960)
+                fig.update_traces(marker=dict(size=3))
+                fig.write_html(str(out_html_alt), include_plotlyjs='cdn', full_html=True)
+            except Exception as e:
+                print(f"Interactive HTML export (alt) failed: {e}")
+    except Exception as e:
+        print(f"Alternate dimensionality export failed: {e}")
+
     out = {"status": "ok", "csv": str(out_csv), "png": str(out_png), "books": len(labels)}
     print(out)
     return out
@@ -1465,13 +2027,13 @@ def style_map_gpu(
     trim_frac: float = 0.2,
     book_topk: int = 5,
     use_projection: bool = False,
-    interactive_html: bool = False,
-    cluster_method: str = "none",
+    interactive_html: bool = True,
+    cluster_method: str = "kmeans",
     n_clusters: int = 12,
     hdbscan_min_cluster_size: int = 10,
     hdbscan_min_samples: int | None = None,
     drop_outliers: bool = False,
-    prune_top_pct: float = 0.0,
+    prune_top_pct: float = 0.02,
     prune_knn_k: int = 10,
     num_chunks = 'auto',
     chunk_size: int = 14,
@@ -1734,6 +2296,7 @@ def calibrate_style_similarity_remote(
     volumes={"/vol": artifacts_vol, "/input": training_vol},
     secrets=[],
     gpu="H200",
+    cpu=8,
     timeout=60 * 20,
     env={**COMMON_ENV, "PYTHONPATH": "/workspace"},
 )
@@ -2540,6 +3103,12 @@ def pipeline(
 def pipeline_contrastive(
     # Prepare args (defaults tuned)
     training_dir: str = "/input/training",
+    # Sharding controls: off by default for reliability
+    force_sharded: bool = False,
+    auto_shard: bool = False,
+    sharded_switch_threshold: int = 50000,
+    containers: int = 100,
+    per_container_workers: int = 8,
     chunk_size: int = 14,
     overlap: int = 4,
     train_ratio: float = 0.7,
@@ -2565,28 +3134,59 @@ def pipeline_contrastive(
     max_length: int = 512,
 ):
     # Prepare datasets
-    # Auto-enable experimental ANN miner if a prior contrastive checkpoint exists
+    # Decide sharded vs single-container prepare
     import os as _os
     _ann_dir = "/vol/models/book_matcher_contrastive/final"
     _ann_ok = _os.path.exists(f"{_ann_dir}/pytorch_model.bin") or _os.path.exists(f"{_ann_dir}/model.safetensors")
 
-    prepare_remote_gpu.remote(
-        training_dir=training_dir,
-        chunk_size=chunk_size,
-        overlap=overlap,
-        train_ratio=train_ratio,
-        val_ratio=val_ratio,
-        max_chunks_per_book=max_chunks_per_book,
-        use_hard_negatives=use_hard_negatives,
-        use_embedding_hard_negatives=use_embedding_hard_negatives,
-        embedding_model=embedding_model,
-        num_chunks_for_embed=num_chunks_for_embed,
-        num_hard_negative_books=num_hard_negative_books,
-        n_positive_per_book=n_positive_per_book,
-        n_negative_per_book=n_negative_per_book,
-        use_ann_chunk_negatives=_ann_ok,
-        ann_miner_model_dir=(_ann_dir if _ann_ok else None),
-    )
+    # Count only if auto_shard is requested; otherwise skip the RPC for speed
+    n_books = 0
+    if auto_shard:
+        try:
+            stat = count_training_texts_remote.remote(training_dir=training_dir)
+            n_books = int(stat.get("count", 0))
+        except Exception:
+            n_books = 0
+    use_sharded = bool(force_sharded or (auto_shard and (n_books >= int(sharded_switch_threshold))))
+
+    if use_sharded:
+        print({"prepare_mode": "sharded", "books": n_books, "threshold": int(sharded_switch_threshold), "force": bool(force_sharded), "auto": bool(auto_shard)})
+        prepare_sharded_remote.remote(
+            training_dir=training_dir,
+            containers=int(containers),
+            per_container_workers=int(per_container_workers),
+            chunk_size=chunk_size,
+            overlap=overlap,
+            max_chunks_per_book=max_chunks_per_book,
+            use_hard_negatives=use_hard_negatives,
+            train_ratio=train_ratio,
+            val_ratio=val_ratio,
+            use_embedding_hard_negatives=use_embedding_hard_negatives,
+            embedding_model=embedding_model,
+            num_chunks_for_embed=num_chunks_for_embed,
+            num_hard_negative_books=num_hard_negative_books,
+            n_positive_per_book=n_positive_per_book,
+            n_negative_per_book=n_negative_per_book,
+        )
+    else:
+        print({"prepare_mode": "single", "books": n_books, "auto": bool(auto_shard)})
+        prepare_remote_gpu.remote(
+            training_dir=training_dir,
+            chunk_size=chunk_size,
+            overlap=overlap,
+            train_ratio=train_ratio,
+            val_ratio=val_ratio,
+            max_chunks_per_book=max_chunks_per_book,
+            use_hard_negatives=use_hard_negatives,
+            use_embedding_hard_negatives=use_embedding_hard_negatives,
+            embedding_model=embedding_model,
+            num_chunks_for_embed=num_chunks_for_embed,
+            num_hard_negative_books=num_hard_negative_books,
+            n_positive_per_book=n_positive_per_book,
+            n_negative_per_book=n_negative_per_book,
+            use_ann_chunk_negatives=_ann_ok,
+            ann_miner_model_dir=(_ann_dir if _ann_ok else None),
+        )
     # Train contrastive on GPU
     train_contrastive_remote_gpu.remote(
         model_name=model,
@@ -2603,6 +3203,17 @@ def pipeline_contrastive(
         # Avoid double prepare in pipeline
         prepare_before_train=False,
     )
+    # Calibrate contrastive classifier (temperature + threshold) on GPU
+    calibrate_contrastive_remote_gpu.remote(
+        model_dir=f"{output_subdir}/final",
+        data_subdir=data_subdir,
+        calibrate_for="accuracy",
+        target_recall=0.85,
+        batch_size=512,
+        num_proc=4,
+        num_workers=4,
+        max_length=max_length,
+    )
     # Calibrate style similarity on GPU (auto-generates pairs if needed)
     calibrate_style_similarity_remote_gpu.remote(
         model_dir=f"{output_subdir}/final",
@@ -2615,7 +3226,7 @@ def pipeline_contrastive(
         force_generate=True,
     )
     # Cross-encoder training is triggered by train_contrastive_remote_gpu by default.
-    return {"status": "pipeline_contrastive completed: prepared + trained contrastive + trained cross-encoder"}
+    return {"status": "pipeline_contrastive completed: prepared + trained contrastive + calibrated classifier + calibrated style"}
 
 
 # One-click: prepare -> train contrastive (GPU) -> calibrate style similarity (GPU)
@@ -2653,7 +3264,17 @@ def pipeline_style(
         # Avoid double prepare in pipeline
         prepare_before_train=False,
     )
-    # 3) Calibrate style similarity (auto-select, GPU)
+    # 3) Calibrate contrastive classifier (GPU)
+    calibrate_contrastive_remote_gpu.remote(
+        model_dir=model_dir,
+        data_subdir=dataset_dir,
+        calibrate_for="accuracy",
+        target_recall=0.85,
+        batch_size=512,
+        num_proc=4,
+        num_workers=4,
+    )
+    # 4) Calibrate style similarity (auto-select, GPU)
     calibrate_style_similarity_remote_gpu.remote(
         model_dir=model_dir,
         pairs_csv="/vol/data/style_pairs_autogen.csv",
@@ -2665,7 +3286,7 @@ def pipeline_style(
         pairs_per_class=5000,
         force_generate=True,
     )
-    return {"status": "pipeline_style completed: prepared + trained + calibrated"}
+    return {"status": "pipeline_style completed: prepared + trained + calibrated classifier + calibrated style"}
 # Inference (contrastive)
 @app.function(
     image=image_cpu,
@@ -2799,4 +3420,979 @@ def evaluate_contrastive(
         data_subdir=data_subdir,
         calibration_path=calibration_path,
         max_length=512,
+    )
+
+
+# -------------------------------
+# Gutenberg ingestion (txt only)
+# -------------------------------
+
+def _slugify(s: str) -> str:
+    import re, unicodedata
+    s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode("ascii")
+    s = s.strip().lower()
+    # Replace apostrophes and dashes with space
+    s = s.replace("'", " ").replace("\u2019", " ").replace("-", " ")
+    # Remove non-alphanumeric except spaces
+    s = re.sub(r"[^a-z0-9\s]", "", s)
+    # Collapse whitespace and join with underscores
+    s = re.sub(r"\s+", " ", s).strip()
+    return s.replace(" ", "_") or "untitled"
+
+
+def _clip_slug(slug: str, max_len: int, salt: str | None = None) -> str:
+    """Bound a slug to a safe filename length and add a short hash when truncated.
+
+    Ensures the final component stays well under typical 255-byte limits and
+    avoids collisions when multiple long titles share the same prefix.
+    """
+    import hashlib
+    if len(slug) <= max_len:
+        return slug
+    hsrc = (slug + (salt or "")).encode("utf-8")
+    suffix = "__" + hashlib.sha1(hsrc).hexdigest()[:8]
+    keep = max(1, max_len - len(suffix))
+    return slug[:keep] + suffix
+
+
+def _languages_from_text(text: str, max_lines: int = 400) -> list[str] | None:
+    """Parse the 'Language:' header from PG text; returns a list of lowercased names or None if not found."""
+    import re
+    head = text.splitlines()[:max_lines]
+    lang_re = re.compile(r"^\s*Language:\s*(.+)$", re.I)
+    for line in head:
+        m = lang_re.search(line)
+        if m:
+            langs = [x.strip().lower() for x in re.split(r"[,;/]", m.group(1)) if x.strip()]
+            return langs or []
+    return None
+
+
+def _languages_from_path(path: str, max_lines: int = 400) -> list[str] | None:
+    """Open a file and parse the 'Language:' header; returns list or None if not found."""
+    import re
+    lang_re = re.compile(r"^\s*Language:\s*(.+)$", re.I)
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for i, line in enumerate(f):
+                if i >= max_lines:
+                    break
+                m = lang_re.search(line)
+                if m:
+                    langs = [x.strip().lower() for x in re.split(r"[,;/]", m.group(1)) if x.strip()]
+                    return langs or []
+    except Exception:
+        pass
+    return None
+
+
+def _extract_title_author(path: str, max_lines: int = 400) -> tuple[str | None, str | None]:
+    import re
+    title = None
+    author = None
+    start_marker = re.compile(r"\*\*\*\s*START OF THIS PROJECT GUTENBERG EBOOK", re.I)
+    title_re = re.compile(r"^\s*Title:\s*(.+)$", re.I)
+    author_re = re.compile(r"^\s*Author:\s*(.+)$", re.I)
+    byline_re = re.compile(r"^\s*by\s+(.+)$", re.I)
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for i, line in enumerate(f):
+                if i >= max_lines:
+                    break
+                if start_marker.search(line):
+                    break
+                m = title_re.search(line)
+                if m and not title:
+                    title = m.group(1).strip()
+                    continue
+                m = author_re.search(line)
+                if m and not author:
+                    author = m.group(1).strip()
+                    continue
+                # Sometimes the line after Title is a byline
+                if title and not author:
+                    m = byline_re.search(line)
+                    if m:
+                        author = m.group(1).strip()
+                        continue
+    except Exception:
+        pass
+    # Basic cleanup
+    def _clean(v: str | None) -> str | None:
+        if not v:
+            return None
+        v = v.strip().strip("-:;., ")
+        # Truncate at common separators
+        for sep in ["[", "(", "{" ]:
+            if sep in v:
+                v = v.split(sep)[0].strip()
+        return v or None
+    return _clean(title), _clean(author)
+
+
+def _extract_title_author_from_text(text: str, max_lines: int = 400) -> tuple[str | None, str | None]:
+    import re
+    title = None
+    author = None
+    start_marker = re.compile(r"\*\*\*\s*START OF THIS PROJECT GUTENBERG EBOOK", re.I)
+    title_re = re.compile(r"^\s*Title:\s*(.+)$", re.I | re.M)
+    author_re = re.compile(r"^\s*Author:\s*(.+)$", re.I | re.M)
+    byline_re = re.compile(r"^\s*by\s+(.+)$", re.I)
+    head = text.splitlines()[:max_lines]
+    for line in head:
+        if start_marker.search(line):
+            break
+        if not title:
+            m = title_re.search(line)
+            if m:
+                title = m.group(1).strip()
+                continue
+        if not author:
+            m = author_re.search(line)
+            if m:
+                author = m.group(1).strip()
+                continue
+        if title and not author:
+            m = byline_re.search(line)
+            if m:
+                author = m.group(1).strip()
+                continue
+    def _clean(v: str | None) -> str | None:
+        if not v:
+            return None
+        v = v.strip().strip("-:;., ")
+        for sep in ["[", "(", "{"]:
+            if sep in v:
+                v = v.split(sep)[0].strip()
+        return v or None
+    return _clean(title), _clean(author)
+
+
+def _best_pg_urls_for_id(gid: int, prefer_plain_txt_first: bool = True) -> list[str]:
+    base = f"https://www.gutenberg.org/cache/epub/{gid}/"
+    candidates = [
+        f"pg{gid}.txt",
+        f"pg{gid}-0.txt",
+        f"pg{gid}.txt.utf-8",
+        f"pg{gid}-utf8.txt",
+        f"pg{gid}-8.txt",
+    ]
+    if not prefer_plain_txt_first:
+        # Move pg{id}.txt lower if we prefer UTF-8 first
+        candidates = [f"pg{gid}-0.txt", f"pg{gid}.txt.utf-8", f"pg{gid}-utf8.txt", f"pg{gid}.txt", f"pg{gid}-8.txt"]
+    return [base + x for x in candidates]
+
+
+@app.function(
+    image=image_data,
+    volumes={"/training": training_vol},
+    timeout=60 * 60 * 6,
+    # Respect account limit; caller can further gate concurrency in the driver.
+    max_containers=100,
+    # Give each fetch container modest CPU for cleaning work without overcommitting.
+    cpu=2,
+    env={"PYTHONPATH": "/workspace"},
+)
+def gutenberg_fetch_http_remote(
+    ids: list[int] | None = None,
+    urls: list[str] | None = None,
+    # HTTP concurrency per container (network-bound). Tune 16–32.
+    max_concurrency: int = 24,
+    # Parallelize across IDs within a container; each ID tries its candidates sequentially.
+    id_concurrency: int = 32,
+    # Cap concurrent writes to the Modal volume per container to reduce contention.
+    io_concurrency: int = 8,
+    # Simple retry policy for transient mirror failures.
+    retries: int = 3,
+    # Hard cap per-ID total duration to avoid long-tail stalls (seconds)
+    per_id_timeout_s: float = 90.0,
+    connect_timeout: float = 10.0,
+    read_timeout: float = 30.0,
+    raw_root: str = "/training/gutenberg/http_raw",
+    out_root: str = "/training/training/gutenberg",
+    meta_root: str = "/training/metadata",
+    prefer_plain_txt_first: bool = True,
+    keep_raw: bool = False,
+    skip_if_exists: bool = True,
+):
+    """Download Gutenberg plain-text files over HTTP and write cleaned copies into the training volume.
+
+    - If `ids` is provided, constructs URL candidates like `.../pg{id}.txt`, with UTF-8 fallbacks.
+    - If `urls` is provided, uses those URLs as-is.
+    - Saves raw copies under `raw_root` (by id or hash) and cleaned copies under `out_root/{author_slug}/{title_slug}.txt`.
+    """
+    import asyncio
+    import os
+    import hashlib
+    import httpx
+    import time
+    import random
+    import shutil
+    from pathlib import Path
+    from standardize_training import clean_text as _clean_text
+
+    # Ensure destination directories
+    Path(out_root).mkdir(parents=True, exist_ok=True)
+    if keep_raw:
+        Path(raw_root).mkdir(parents=True, exist_ok=True)
+    meta_path = Path(meta_root) / "index_http.jsonl"
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Build worklist
+    work: list[tuple[str, int | None]] = []  # (url, id)
+    if urls:
+        for u in urls:
+            work.append((u, None))
+    if ids:
+        for gid in ids:
+            for u in _best_pg_urls_for_id(int(gid), prefer_plain_txt_first=prefer_plain_txt_first):
+                work.append((u, int(gid)))
+
+    # De-dup by URL while preserving order
+    seen = set()
+    uniq_work: list[tuple[str, int | None]] = []
+    for url, gid in work:
+        if url not in seen:
+            uniq_work.append((url, gid))
+            seen.add(url)
+
+    headers = {
+        "User-Agent": "writing7/1.0 (Modal; contact: please-provide)"
+    }
+
+    # Concurrency controls
+    net_sem = asyncio.Semaphore(max(1, min(max_concurrency, 128)))
+    io_sem = asyncio.Semaphore(max(1, min(io_concurrency, 64)))
+    results: list[dict] = []
+
+    async def _http_get_with_retries(client: httpx.AsyncClient, url: str) -> httpx.Response | None:
+        delay = 0.5
+        for attempt in range(max(1, retries)):
+            try:
+                r = await client.get(url, follow_redirects=True)
+                if r.status_code == 200 and not r.headers.get("Content-Type", "").startswith("text/html"):
+                    return r
+            except Exception:
+                pass
+            if attempt < retries - 1:
+                # Exponential backoff with jitter
+                await asyncio.sleep(delay + random.uniform(0, 0.25))
+                delay *= 2
+        return None
+
+    async def _atomic_move(src: Path, dst: Path):
+        """Move src -> dst atomically if possible, with EXDEV fallback."""
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.replace(src, dst)
+        except OSError:
+            shutil.move(str(src), str(dst))
+
+    async def fetch_and_store(client: httpx.AsyncClient, url: str, gid: int | None):
+        nonlocal results
+        async with net_sem:
+            try:
+                r = await _http_get_with_retries(client, url)
+                if r is None:
+                    return False
+                data = r.text  # httpx decodes with apparent encoding
+            except Exception:
+                return False
+
+        # Extract minimal metadata from header
+        try:
+            title, author = _extract_title_author_from_text(data)
+        except Exception:
+            title, author = None, None
+        # Language filter: include only English when explicitly specified
+        langs = None
+        try:
+            langs = _languages_from_text(data)
+        except Exception:
+            langs = None
+        if langs is not None and any(l != "english" for l in langs):
+            return True  # treat as handled/skipped without error
+
+        # Slugify and bound component lengths
+        title_slug = _slugify(title or (f"pg{gid}" if gid else hashlib.sha1(url.encode()).hexdigest()[:10]))
+        author_slug = _slugify(author or "unknown_author")
+        title_slug = _clip_slug(title_slug, 120, salt=str(gid) if gid is not None else url)
+        author_slug = _clip_slug(author_slug, 80)
+
+        # Save raw (optional) — gate volume writes
+        raw_path_str = None
+        if keep_raw:
+            raw_name = f"pg{gid}.txt" if gid else hashlib.sha1(url.encode()).hexdigest() + ".txt"
+            raw_path = Path(raw_root) / raw_name
+            tmp_raw = Path("/tmp/gutenberg_raw") / raw_name
+            tmp_raw.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                tmp_raw.write_text(data, encoding="utf-8", errors="ignore")
+                async with io_sem:
+                    await _atomic_move(tmp_raw, raw_path)
+                raw_path_str = str(raw_path.relative_to(Path(raw_root).parent.parent))
+            except Exception:
+                pass
+
+        # Clean in memory (CPU-light)
+        try:
+            cleaned = _clean_text(data)
+        except Exception:
+            cleaned = data
+
+        # Stage to /tmp, then atomically move into the volume under an IO semaphore
+        dst_dir = Path(out_root) / author_slug
+        dst = dst_dir / f"{title_slug}.txt"
+        # Skip duplicates or suffix on collision
+        if dst.exists():
+            if skip_if_exists:
+                return True
+            else:
+                suffix = f"__pg{gid}" if gid is not None else "__dup"
+                # Ensure filename stays within bounds after suffix is added
+                title_with_suffix = _clip_slug(f"{title_slug}{suffix}", 120)
+                dst = dst_dir / f"{title_with_suffix}.txt"
+
+        tmp_dst = Path("/tmp/gutenberg_proc") / author_slug / dst.name
+        tmp_dst.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            tmp_dst.write_text(cleaned, encoding="utf-8")
+            async with io_sem:
+                await _atomic_move(tmp_dst, dst)
+        except Exception:
+            # Best-effort fallback to direct write under semaphore
+            try:
+                async with io_sem:
+                    dst_dir.mkdir(parents=True, exist_ok=True)
+                    dst.write_text(cleaned, encoding="utf-8")
+            except Exception:
+                return False
+
+        rec = {
+            "source": "gutenberg_http",
+            "url": url,
+            "gutenberg_id": gid,
+            "author": author or "unknown",
+            "title": title or title_slug.replace("_", " "),
+            "author_slug": author_slug,
+            "title_slug": title_slug,
+            "raw_path": raw_path_str,
+            "processed_path": str(dst.relative_to(Path(out_root).parent.parent)),
+            "languages": langs,
+        }
+        results.append(rec)
+        return True
+
+    async def main():
+        limits = httpx.Limits(
+            max_keepalive_connections=max(8, min(max_concurrency * 2, 256)),
+            max_connections=max(8, min(max_concurrency * 4, 256)),
+        )
+        # httpx>=0.27 requires either a default timeout or all individual timeouts.
+        timeout = httpx.Timeout(timeout=None, connect=connect_timeout, read=read_timeout, write=30.0, pool=30.0)
+        async with httpx.AsyncClient(headers=headers, limits=limits, timeout=timeout, http2=True) as client:
+            # If ids were provided, stop after the first successful candidate per id.
+            # Run multiple IDs concurrently to avoid long-tail stalls.
+            if ids:
+                # Group by id
+                by_id: dict[int, list[str]] = {}
+                for url, gid in uniq_work:
+                    if gid is None:
+                        continue
+                    by_id.setdefault(int(gid), []).append(url)
+
+                id_sem = asyncio.Semaphore(max(1, min(id_concurrency, 128)))
+
+                async def _process_one_id(gid: int, urls_for_id: list[str]):
+                    async with id_sem:
+                        for url in urls_for_id:
+                            try:
+                                ok = await asyncio.wait_for(fetch_and_store(client, url, gid), timeout=per_id_timeout_s)
+                            except asyncio.TimeoutError:
+                                ok = False
+                            if ok:
+                                break
+
+                await asyncio.gather(*[_process_one_id(g, u) for g, u in by_id.items()])
+            # URLs as-is (no id semantics)
+            if urls:
+                await asyncio.gather(*[fetch_and_store(client, u, None) for u, _ in uniq_work if _ is None])
+
+    asyncio.run(main())
+
+    # Append metadata
+    if results:
+        # Append once per container to reduce small writes contention
+        with open(meta_path, "a", encoding="utf-8") as mf:
+            for rec in results:
+                import json
+                mf.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        print(f"Fetched {len(results)} files. Metadata appended to {meta_path}.")
+    else:
+        print("No files fetched.")
+
+
+@app.local_entrypoint()
+def gutenberg_fetch_http(
+    ids_csv: str | None = None,
+    start_id: int | None = None,
+    end_id: int | None = None,
+    url: str | None = None,
+    max_concurrency: int = 16,
+    prefer_plain_txt_first: bool = True,
+):
+    """Fetch Gutenberg plain-text files over HTTP by ids or direct URL.
+
+    Examples:
+    - Single: modal run modal_app.py::gutenberg_fetch_http --url https://www.gutenberg.org/cache/epub/1342/pg1342.txt
+    - Range: modal run modal_app.py::gutenberg_fetch_http --start-id 1 --end-id 2000
+    - CSV:   modal run modal_app.py::gutenberg_fetch_http --ids-csv 12,1342,2701
+    """
+    ids: list[int] | None = None
+    urls: list[str] | None = None
+    if url:
+        urls = [url]
+    if ids_csv:
+        ids = [int(x.strip()) for x in ids_csv.split(',') if x.strip().isdigit()]
+    elif start_id is not None and end_id is not None:
+        ids = list(range(int(start_id), int(end_id) + 1))
+    return gutenberg_fetch_http_remote.remote(
+        ids=ids,
+        urls=urls,
+        max_concurrency=max_concurrency,
+        prefer_plain_txt_first=prefer_plain_txt_first,
+    )
+
+
+@app.local_entrypoint()
+def gutenberg_fetch_all_http(
+    start_id: int = 1,
+    end_id: int = 80000,
+    chunk_size: int = 500,
+    # How many containers to keep in-flight concurrently (<= 100 account limit)
+    containers: int = 96,
+    # Per-container network concurrency (HTTP requests), tuned for mirrors
+    per_container_concurrency: int = 24,
+    # Per-container volume write concurrency
+    io_concurrency: int = 8,
+    # Retries for transient fetch errors
+    retries: int = 3,
+    prefer_plain_txt_first: bool = True,
+):
+    """Fetch a full range of Gutenberg IDs over HTTP using parallel containers.
+
+    Example:
+      modal run modal_app.py::gutenberg_fetch_all_http --start-id 1 --end-id 80000 --chunk-size 500 --containers 96 --per-container-concurrency 24
+    """
+    ids = list(range(int(start_id), int(end_id) + 1))
+    chunks: list[list[int]] = [ids[i:i + chunk_size] for i in range(0, len(ids), chunk_size)]
+    n_chunks = len(chunks)
+    print(f"Submitting {n_chunks} chunks of size {chunk_size} with up to {containers} containers in flight...")
+
+    # Bound in-flight containers to avoid exceeding account limit and to control mirror load
+    inflight: list = []
+    submitted = 0
+    completed = 0
+    for chunk in chunks:
+        call = gutenberg_fetch_http_remote.spawn(
+            ids=chunk,
+            max_concurrency=per_container_concurrency,
+            id_concurrency=min(per_container_concurrency, 64),
+            io_concurrency=io_concurrency,
+            retries=retries,
+            prefer_plain_txt_first=prefer_plain_txt_first,
+            skip_if_exists=True,
+        )
+        inflight.append(call)
+        submitted += 1
+        if len(inflight) >= max(1, min(containers, 100)):
+            # Wait for current batch to finish
+            for c in inflight:
+                try:
+                    c.get()
+                except Exception as e:
+                    print(f"Container failed: {e}")
+                finally:
+                    completed += 1
+            inflight.clear()
+            print(f"Progress: {completed}/{n_chunks} chunks done.")
+
+    # Flush remaining
+    if inflight:
+        for c in inflight:
+            try:
+                c.get()
+            except Exception as e:
+                print(f"Container failed: {e}")
+            finally:
+                completed += 1
+        inflight.clear()
+
+    print(f"All chunks completed: {completed}/{n_chunks}.")
+
+
+@app.function(
+    image=image_data,
+    volumes={"/training": training_vol},
+    timeout=60 * 60,
+)
+def cleanup_training_remote(
+    keep_paths: list[str] | None = None,
+):
+    """Remove everything under /training except the specified keep_paths.
+
+    Defaults to keeping '/training/training' and '/training/metadata'.
+    """
+    from pathlib import Path
+    import shutil
+    root = Path("/training")
+    default_keep = {"training", "metadata"}
+    keep = set(keep_paths) if keep_paths else default_keep
+    # Normalize keep to top-level names under /training
+    keep_names = set()
+    for p in keep:
+        name = p.strip("/").split("/")[1] if p.startswith("/training/") else p.strip("/").split("/")[0]
+        if name:
+            keep_names.add(name)
+    removed = []
+    for child in root.iterdir():
+        if child.name in keep_names:
+            continue
+        try:
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink(missing_ok=True)
+            removed.append(child.name)
+        except Exception as e:
+            print(f"Failed to remove {child}: {e}")
+    print({"removed": removed, "kept": sorted(list(keep_names))})
+
+
+@app.local_entrypoint()
+def cleanup_training():
+    return cleanup_training_remote.remote(keep_paths=["/training/training", "/training/metadata"])
+
+
+def _guess_gutenberg_id(name: str) -> str | None:
+    import re
+    # Match 12345, 12345-0, pg12345, etc.
+    m = re.search(r"(?:pg)?(\d+)", name)
+    return m.group(1) if m else None
+
+
+@app.function(
+    image=image_data,
+    volumes={"/training": training_vol},
+    timeout=60 * 60 * 12,
+    max_containers=100,
+    cpu=2,
+    env={"PYTHONPATH": "/workspace"},
+)
+def gutenberg_ingest_remote(
+    remote: str = "rsync://aleph.gutenberg.org/gutenberg/",
+    raw_root: str = "/training/gutenberg/raw",
+    out_root: str = "/training/training/gutenberg",
+    prefer_utf8_variants: bool = True,
+    utf8_only: bool = True,
+    exclude_old: bool = True,
+    keep_raw: bool = False,
+    meta_root: str = "/training/metadata",
+    max_files: int | None = None,
+    parallelism: int = 0,
+    rsync_shards: int = 0,
+):
+    """Mirror Gutenberg .txt files into the training volume and index by author/title.
+
+    - Mirrors only .txt (with UTF-8 variants) using rsync, preserving directory structure under raw_root.
+    - Parses Title and Author from PG header and writes processed copies to out_root/{author_slug}/{title_slug}.txt
+    - Appends metadata rows to /training/gutenberg/metadata/index.jsonl
+    """
+    import os
+    import json
+    import shutil
+    from pathlib import Path
+    from subprocess import run, CalledProcessError
+
+    # Ensure dirs
+    Path(raw_root).mkdir(parents=True, exist_ok=True)
+    Path(meta_root).mkdir(parents=True, exist_ok=True)
+    Path(out_root).mkdir(parents=True, exist_ok=True)
+
+    # Build rsync include/exclude patterns
+    includes = ["*/"]
+    if utf8_only:
+        # Strict UTF-8 only
+        includes += ["*-0.txt", "*.txt.utf-8", "*-utf8.txt"]
+    else:
+        if prefer_utf8_variants:
+            includes += ["*-0.txt", "*-8.txt", "*.txt.utf-8"]
+        includes += ["*.txt"]
+    rsync_cmd = [
+        "rsync", "-azv", "--delete", "--delete-after", "--no-perms", "--no-owner", "--no-group", "--prune-empty-dirs",
+        "--partial", "--timeout=60", "--contimeout=60", "--no-motd",
+    ]
+    # Order matters: first-match wins.
+    # 1) Exclude old/ trees early so we don't descend into them.
+    if exclude_old:
+        rsync_cmd += ["--exclude", "*/old/**"]
+    # 2) Allow directory recursion.
+    rsync_cmd += ["--include", "*/"]
+    # 3) Include desired file patterns.
+    for pat in [p for p in includes if p != "*/"]:
+        rsync_cmd += ["--include", pat]
+    rsync_cmd += ["--exclude", "*"]
+    
+    # Try the requested remote, then fall back to a few known-good mirrors
+    mirror_candidates = [remote]
+    # Append fallbacks if not already present
+    fallbacks = [
+        "rsync://aleph.gutenberg.org/gutenberg/",
+        "rsync://gutenberg.mirror.ac.uk/gutenberg/",
+        "rsync://ftp.funet.fi/pub/mirrors/gutenberg/",
+        "rsync://mirrors.ocf.berkeley.edu/gutenberg/",
+        # MirrorService uses different module paths; try common ones
+        "rsync://rsync.mirrorservice.org/mirror/ftp.ibiblio.org/gutenberg/",
+        "rsync://rsync.mirrorservice.org/sites/ftp.ibiblio.org/gutenberg/",
+    ]
+    for fb in fallbacks:
+        if fb not in mirror_candidates:
+            mirror_candidates.append(fb)
+
+    def _rsync_once(src: str, dst: str) -> bool:
+        from subprocess import run, CalledProcessError
+        for m in mirror_candidates:
+            cmd = rsync_cmd + [src if src.startswith("rsync://") else (m.rstrip('/') + '/' + src.lstrip('/')), dst]
+            print("Running:", " ".join(cmd))
+            try:
+                res = run(cmd, check=True)
+                print("rsync exit code:", res.returncode)
+                return True
+            except CalledProcessError as e:
+                print(f"rsync failed for {cmd[-2]}: {e}")
+                continue
+        return False
+
+    # If sharding requested, sync numeric top-level directories with limited parallelism
+    if rsync_shards and rsync_shards > 0:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        digits = [str(d) for d in range(10)]
+        # Ensure local shard dirs exist
+        for d in digits:
+            (Path(raw_root) / d).mkdir(parents=True, exist_ok=True)
+        max_workers = min(max(1, rsync_shards), len(digits))
+        results = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futs = {}
+            for d in digits:
+                # Build shard-specific src (relative subpath) and shared destination root
+                src = d + "/"
+                dst_dir = str((Path(raw_root) / d)) + "/"
+                (Path(dst_dir)).mkdir(parents=True, exist_ok=True)
+                futs[ex.submit(_rsync_once, src, dst_dir)] = d
+            for fut in as_completed(futs):
+                d = futs[fut]
+                ok = False
+                try:
+                    ok = fut.result()
+                except Exception as e:
+                    print(f"Shard {d} failed with exception: {e}")
+                results[d] = ok
+        ok_count = sum(1 for v in results.values() if v)
+        print(f"Shard rsync complete: {ok_count}/{len(digits)} shards succeeded.")
+        if ok_count == 0:
+            print("All rsync shards failed; proceeding with any existing local files.")
+    else:
+        # Single stream rsync for entire tree
+        synced = _rsync_once(remote, raw_root + "/")
+        if not synced:
+            print("All rsync mirrors failed; proceeding with any existing local files.")
+
+    # Walk raw mirror and collect candidate files
+    raw_files_all = sorted([p for p in Path(raw_root).rglob("*.txt*") if p.is_file()])
+    # Select a single main file per Gutenberg ID
+    def _gid_for(p: Path) -> str | None:
+        # Prefer immediate parent directory name if numeric
+        try:
+            parent = p.parent.name
+            if parent.isdigit():
+                return parent
+        except Exception:
+            pass
+        return _guess_gutenberg_id(p.name)
+
+    def _score_name(name: str) -> int:
+        ln = name.lower()
+        if ln.endswith("-0.txt"):  # new UTF-8 canonical
+            return 400
+        if ln.endswith(".txt.utf-8") or ln.endswith("-utf8.txt"):
+            return 350
+        if ln.endswith("-8.txt"):  # ISO-8859-1 older
+            return 300
+        if ln.endswith(".txt"):
+            return 100
+        return 0
+
+    selected: dict[str, Path] = {}
+    for p in raw_files_all:
+        gid = _gid_for(p)
+        if not gid:
+            continue
+        # If utf8_only, only accept UTF-8 variants
+        if utf8_only:
+            nl = p.name.lower()
+            if not (nl.endswith('-0.txt') or nl.endswith('.txt.utf-8') or nl.endswith('-utf8.txt')):
+                continue
+        cur = selected.get(gid)
+        if cur is None or _score_name(p.name) > _score_name(cur.name):
+            selected[gid] = p
+
+    raw_files = list(selected.values())
+    raw_files.sort()
+    if max_files is not None:
+        raw_files = raw_files[:max_files]
+    print(f"Selected {len(raw_files)} primary files (from {len(raw_files_all)} candidates) under {raw_root}")
+
+    meta_path = Path(meta_root) / "index.jsonl"
+    seen_processed = set()
+    if meta_path.exists():
+        try:
+            with open(meta_path, "r", encoding="utf-8", errors="ignore") as mf:
+                for line in mf:
+                    try:
+                        rec = json.loads(line)
+                        seen_processed.add(rec.get("processed_path", ""))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    # Process files either sequentially or in parallel map
+    appended = 0
+    if parallelism and parallelism > 1:
+        # Use modal map for parallel processing
+        rels = [str(p.relative_to(raw_root)) for p in raw_files]
+        # Stream results and append to a single index file from the driver
+        with open(meta_path, "a", encoding="utf-8") as mf:
+            for i, rec in enumerate(gutenberg_process_file_remote.map(rels), 1):
+                if not rec:
+                    continue
+                if rec.get("processed_path", "") in seen_processed:
+                    continue
+                mf.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                appended += 1
+                if i % 500 == 0:
+                    print(f"[{i}/{len(rels)}] Indexed: {rec.get('processed_path')}")
+    else:
+        for i, src in enumerate(raw_files, 1):
+            rec = _process_one_gutenberg(str(src), raw_root=raw_root, out_root=out_root)
+            if not rec:
+                continue
+            if rec.get("processed_path", "") in seen_processed:
+                continue
+            with open(meta_path, "a", encoding="utf-8") as mf:
+                mf.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            appended += 1
+            if i % 500 == 0:
+                print(f"[{i}/{len(raw_files)}] Indexed: {rec.get('processed_path')}")
+
+    print(f"Done. Appended {appended} new records to {meta_path}.")
+    print(f"Processed output under: {out_root}")
+    # Optionally remove raw mirror to keep only processed files
+    if not keep_raw:
+        try:
+            import shutil
+            shutil.rmtree(raw_root, ignore_errors=True)
+            print(f"Removed raw mirror at {raw_root}")
+        except Exception as e:
+            print(f"Could not remove raw mirror at {raw_root}: {e}")
+
+
+def _process_one_gutenberg(src_path: str, raw_root: str, out_root: str) -> dict | None:
+    """Helper to process a single raw .txt file and return a metadata record."""
+    import shutil
+    from pathlib import Path
+    src = Path(src_path)
+    # Extract metadata and filter non-English when header is present
+    title, author = _extract_title_author(str(src))
+    langs = _languages_from_path(str(src))
+    if langs is not None and any(l != "english" for l in langs):
+        return None
+    title_slug = _slugify(title or src.stem)
+    author_slug = _slugify(author or "unknown_author")
+    # Bound slug lengths to avoid filesystem component overflows
+    title_slug = _clip_slug(title_slug, 120, salt=str(src))
+    author_slug = _clip_slug(author_slug, 80)
+
+    # Destination path (author dir + title filename)
+    dst_dir = Path(out_root) / author_slug
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    dst = dst_dir / f"{title_slug}.txt"
+    if dst.exists():
+        gid = _guess_gutenberg_id(src.name) or ""
+        alt = dst_dir / f"{_clip_slug(title_slug + f"__pg{gid or 'dup'}", 120)}.txt"
+        dst = alt
+
+    # Copy with cleaning
+    try:
+        try:
+            from standardize_training import clean_text as _clean_text
+        except Exception:
+            _clean_text = None
+        raw_txt = src.read_text(encoding="utf-8", errors="ignore")
+        cleaned = _clean_text(raw_txt) if _clean_text else raw_txt
+        dst.write_text(cleaned, encoding="utf-8")
+    except Exception:
+        # Fallback raw copy
+        shutil.copy2(src, dst)
+
+    record = {
+        "source": "gutenberg",
+        "raw_path": str(src.relative_to(Path(raw_root).parent.parent)),
+        "processed_path": str(dst.relative_to(Path(out_root).parent.parent)),
+        "author": author or "unknown",
+        "title": title or title_slug.replace("_", " "),
+        "author_slug": author_slug,
+        "title_slug": title_slug,
+        "gutenberg_id": _guess_gutenberg_id(src.name),
+        "size_bytes": src.stat().st_size if src.exists() else None,
+        "languages": langs,
+    }
+    return record
+
+
+@app.function(
+    image=image_data,
+    volumes={"/training": training_vol},
+    timeout=60 * 60 * 4,
+    max_containers=100,
+    cpu=2,
+    env={"PYTHONPATH": "/workspace"},
+)
+def gutenberg_process_file_remote(src_rel: str, raw_root: str = "/training/gutenberg/raw", out_root: str = "/training/training/gutenberg") -> dict | None:
+    from pathlib import Path
+    abs_src = str(Path(raw_root) / src_rel)
+    return _process_one_gutenberg(abs_src, raw_root=raw_root, out_root=out_root)
+
+
+@app.local_entrypoint()
+def gutenberg_ingest(
+    remote: str = "rsync://aleph.gutenberg.org/gutenberg/",
+    raw_root: str = "/training/gutenberg/raw",
+    out_root: str = "/training/training/gutenberg",
+    prefer_utf8_variants: bool = True,
+    max_files: int | None = None,
+    parallelism: int = 0,
+    utf8_only: bool = True,
+    exclude_old: bool = True,
+    rsync_shards: int = 0,
+):
+    """Local entrypoint wrapper for Gutenberg ingest.
+
+    Typical usage:
+    - modal run modal_app.py::gutenberg_ingest
+    - modal run modal_app.py::gutenberg_ingest --max-files 50000
+    """
+    return gutenberg_ingest_remote.remote(
+        remote=remote,
+        raw_root=raw_root,
+        out_root=out_root,
+        prefer_utf8_variants=prefer_utf8_variants,
+        max_files=max_files,
+        parallelism=parallelism,
+        utf8_only=utf8_only,
+        exclude_old=exclude_old,
+        rsync_shards=rsync_shards,
+    )
+
+
+# -------------------------------
+# Volume wiping utilities
+# -------------------------------
+
+@app.function(
+    image=image_data,
+    volumes={"/vol": artifacts_vol, "/training": training_vol},
+    timeout=60 * 60,
+)
+def wipe_volumes_remote(
+    dry_run: bool = True,
+    preserve_hf_cache: bool = True,
+    preserve_models: bool = False,
+    confirm: bool = False,
+):
+    """Delete contents of the training and artifacts volumes.
+
+    - When `dry_run=True`, prints what would be removed.
+    - `preserve_hf_cache`: keeps `/vol/hf` if True.
+    - `preserve_models`: keeps `/vol/models` if True.
+    - `confirm` must be True to actually delete.
+    """
+    import shutil
+    from pathlib import Path
+
+    def _collect_targets(root: Path, keep: set[str]) -> list[Path]:
+        if not root.exists():
+            return []
+        out = []
+        for p in root.iterdir():
+            if p.name in keep:
+                continue
+            out.append(p)
+        return out
+
+    # Training volume: clear everything under /training
+    train_root = Path("/training")
+    keep_train: set[str] = set()
+    train_targets = _collect_targets(train_root, keep_train)
+
+    # Artifacts volume: selectively preserve cache/models
+    vol_root = Path("/vol")
+    keep_vol: set[str] = set()
+    if preserve_hf_cache:
+        keep_vol.add("hf")
+    if preserve_models:
+        keep_vol.add("models")
+    vol_targets = _collect_targets(vol_root, keep_vol)
+
+    print("Training volume targets:")
+    for p in train_targets:
+        print("  ", p)
+    print("Artifacts volume targets:")
+    for p in vol_targets:
+        print("  ", p)
+
+    if dry_run:
+        print("Dry run: no files deleted. Set dry_run=False and confirm=True to proceed.")
+        return {"train": len(train_targets), "artifacts": len(vol_targets), "deleted": 0}
+    if not confirm:
+        print("Refusing to delete without confirm=True.")
+        return {"deleted": 0}
+
+    deleted = 0
+    for p in train_targets + vol_targets:
+        try:
+            if p.is_dir():
+                shutil.rmtree(p)
+            else:
+                p.unlink(missing_ok=True)
+            deleted += 1
+        except Exception as e:
+            print(f"Failed to delete {p}: {e}")
+    print(f"Deleted {deleted} items.")
+    return {"deleted": deleted}
+
+
+@app.local_entrypoint()
+def wipe_volumes(
+    dry_run: bool = True,
+    preserve_hf_cache: bool = True,
+    preserve_models: bool = False,
+    confirm: bool = False,
+):
+    return wipe_volumes_remote.remote(
+        dry_run=dry_run,
+        preserve_hf_cache=preserve_hf_cache,
+        preserve_models=preserve_models,
+        confirm=confirm,
     )

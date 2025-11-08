@@ -1210,7 +1210,7 @@ def train_contrastive(
         report_to='none',
         fp16=(torch.cuda.is_available() and not bf16_ok),
         bf16=bf16_ok,
-        dataloader_num_workers=4,
+        dataloader_num_workers=8,
         remove_unused_columns=False,
         gradient_accumulation_steps=grad_accum_steps,
         gradient_checkpointing=False,

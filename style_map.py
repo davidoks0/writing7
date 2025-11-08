@@ -394,9 +394,7 @@ def plot_map(coords: np.ndarray, labels: List[str], out_png: Path, clusters: np.
     if clusters is None:
         plt.scatter(x, y, s=14, c="#4C78A8", alpha=0.75, edgecolors="none")
     else:
-        import matplotlib.pyplot as plt  # type: ignore
         import matplotlib.cm as cm
-        import numpy as np
         uniq = np.unique(clusters)
         colors = cm.get_cmap('tab20', len(uniq))
         for idx, k in enumerate(uniq):

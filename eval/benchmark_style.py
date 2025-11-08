@@ -43,8 +43,8 @@ def _pick_excerpt(text: str, *, n_sentences: int = 15, rng: random.Random | None
 
 def _default_system_prompt() -> str:
     return (
-        "You are a creative writer. Adopt the narrative voice, pacing, cadence, and paragraphing style of the provided reference, "
-        "but produce original text that does not copy phrases or named entities."
+        "You are a creative writer. Adopt the style style of the provided reference text, "
+        "but produce original text that does NOT copy phrases or named entities from the reference text."
     )
 
 
