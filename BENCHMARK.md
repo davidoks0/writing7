@@ -74,8 +74,9 @@ Code: `eval/benchmark_style.py` and `modal_app.py::run_style_benchmark`
 Run (example):
 ```
 modal run modal_app.py::benchmark_style -- --model anthropic:claude-3-5-sonnet-20241022 \
-  --book eval/books/<book>.txt --n-samples 3
+  --book eval/books/<book>.txt
 ```
+Defaults: 1 sample per excerpt, across 5 different excerpts (5 total generations).
 
 ## Is the description “divorced from topic” accurate?
 

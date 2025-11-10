@@ -65,8 +65,8 @@ def run_benchmark(
     book_path: str,
     topics: Optional[List[str]] = None,
     fixed_topic: Optional[str] = None,
-    n_samples: int = 3,
-    n_excerpts: int = 10,
+    n_samples: int = 1,
+    n_excerpts: int = 5,
     seed: int = 42,
     # Style similarity params
     model_dir: str = "/vol/models/book_matcher_contrastive/final",

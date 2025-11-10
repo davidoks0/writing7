@@ -29,7 +29,8 @@ try:
     _nlp = spacy.blank("en")
     if "sentencizer" not in _nlp.pipe_names:
         _nlp.add_pipe("sentencizer")
-    _nlp.max_length = 10**7  # allow very long texts
+    # Allow very long texts (we don't run parser/NER). 50M is a safe upper bound.
+    _nlp.max_length = 50_000_000
     USE_SPACY = True
 except Exception:
     USE_SPACY = False
@@ -69,9 +70,24 @@ def split_sentences_simple(text: str) -> List[str]:
 
 
 def split_sentences(text: str) -> List[str]:
-    """Split text into sentences using best available method."""
+    """Split text into sentences using best available method.
+
+    Falls back to a fast regex splitter if spaCy raises a max_length error or
+    if the input exceeds the configured limit. For sentencizer-only, increasing
+    max_length is safe; we bump it on the fly when needed.
+    """
     if USE_SPACY:
-        return split_sentences_spacy(text)
+        try:
+            # Bump spaCy limit dynamically if needed (no parser/NER used)
+            try:
+                if len(text) + 1024 > getattr(_nlp, "max_length", 10_000_000):
+                    _nlp.max_length = len(text) + 1024
+            except Exception:
+                pass
+            return split_sentences_spacy(text)
+        except Exception:
+            # Safety net: fall back to simple
+            return split_sentences_simple(text)
     else:
         return split_sentences_simple(text)
 
@@ -599,14 +615,25 @@ def prepare_datasets(
                         probs = []
                         if miner_model == 'contrastive':
                             from inference_contrastive import ContrastiveBookMatcherInference
-                            mdir = miner_model_dir or 'models/book_matcher_contrastive/final'
+                            # Prefer Modal volume path if present; fallback to local models dir
+                            def _pick_dir(default_local: str, default_vol: str) -> str:
+                                import os
+                                if miner_model_dir:
+                                    return miner_model_dir
+                                try:
+                                    if os.path.exists(os.path.join(default_vol, 'pytorch_model.bin')) or os.path.exists(os.path.join(default_vol, 'model.safetensors')):
+                                        return default_vol
+                                except Exception:
+                                    pass
+                                return default_local
+                            mdir = _pick_dir('models/book_matcher_contrastive/final', '/vol/models/book_matcher_contrastive/final')
                             matcher = ContrastiveBookMatcherInference(mdir)
                             for s1, s2, _ob in scored:
                                 res = matcher.predict(s1, s2)
                                 probs.append(res['probability'])
                         else:
                             from inference import BookMatcher
-                            mdir = miner_model_dir or 'models/book_matcher/final'
+                            mdir = miner_model_dir or ('/vol/models/book_matcher/final' if os.path.exists('/vol/models/book_matcher/final') else 'models/book_matcher/final')
                             matcher = BookMatcher(mdir)
                             for s1, s2, _ob in scored:
                                 res = matcher.predict(s1, s2)
@@ -1105,14 +1132,25 @@ def prepare_datasets_from_prechunked(
                         probs = []
                         if miner_model == 'contrastive':
                             from inference_contrastive import ContrastiveBookMatcherInference
-                            mdir = miner_model_dir or 'models/book_matcher_contrastive/final'
+                            # Prefer Modal volume path if present; fallback to local models dir
+                            def _pick_dir(default_local: str, default_vol: str) -> str:
+                                import os
+                                if miner_model_dir:
+                                    return miner_model_dir
+                                try:
+                                    if os.path.exists(os.path.join(default_vol, 'pytorch_model.bin')) or os.path.exists(os.path.join(default_vol, 'model.safetensors')):
+                                        return default_vol
+                                except Exception:
+                                    pass
+                                return default_local
+                            mdir = _pick_dir('models/book_matcher_contrastive/final', '/vol/models/book_matcher_contrastive/final')
                             matcher = ContrastiveBookMatcherInference(mdir)
                             for s1, s2, _ob in scored:
                                 res = matcher.predict(s1, s2)
                                 probs.append(res['probability'])
                         else:
                             from inference import BookMatcher
-                            mdir = miner_model_dir or 'models/book_matcher/final'
+                            mdir = miner_model_dir or ('/vol/models/book_matcher/final' if os.path.exists('/vol/models/book_matcher/final') else 'models/book_matcher/final')
                             matcher = BookMatcher(mdir)
                             for s1, s2, _ob in scored:
                                 res = matcher.predict(s1, s2)

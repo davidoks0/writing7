@@ -55,7 +55,7 @@ class ContrastiveBookMatcherInference:
             raise FileNotFoundError(
                 f"No model weights found under '{model_path}'. Expected files: 'pytorch_model.bin' or 'model.safetensors'. "
                 "If this is a Modal volume path, first download locally, e.g.:\n"
-                "  modal volume get writing7-artifacts /models/book_matcher_contrastive/final ./models/book_matcher_contrastive/final"
+                "  modal volume get writing7-artifacts /vol/models/book_matcher_contrastive/final ./models/book_matcher_contrastive/final"
             )
 
         # Detect base encoder width and whether style/symmetric/projection/attn were used

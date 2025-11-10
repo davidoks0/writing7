@@ -8,8 +8,10 @@ Implements:
 - Longer context support (512 tokens + hierarchical pooling if needed)
 """
 import os
+import time
 import re
 import math
+import contextlib
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
@@ -28,6 +30,34 @@ from transformers import (
 )
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc_auc_score, fbeta_score, balanced_accuracy_score, average_precision_score
 import numpy as np
+
+# Prefer the new SDPA kernel context manager when available; avoid deprecated fallbacks.
+try:
+    from torch.nn.attention import sdpa_kernel as _sdpa_kernel_ctx
+except Exception:
+    _sdpa_kernel_ctx = None
+
+def _fast_sdpa_ctx():
+    """Return a context manager that prefers Flash/MemEff SDPA kernels.
+
+    Uses torch.nn.attention.sdpa_kernel when available (Torch >= 2.1). If not
+    available, returns a no-op context instead of calling the deprecated
+    torch.backends.cuda.sdp_kernel to avoid deprecation warnings.
+    """
+    if not torch.cuda.is_available():
+        return contextlib.nullcontext()
+    if _sdpa_kernel_ctx is not None:
+        try:
+            return _sdpa_kernel_ctx(enable_flash=True, enable_mem_efficient=True, enable_math=False)
+        except TypeError:
+            try:
+                return _sdpa_kernel_ctx(True, True, False)
+            except Exception:
+                pass
+        except Exception:
+            pass
+    # Fallback: no special kernel context
+    return contextlib.nullcontext()
 
 
 class StyleFeatures(nn.Module):
@@ -253,6 +283,26 @@ class ContrastiveBookMatcher(nn.Module):
         config = AutoConfig.from_pretrained(model_name)
         # Load without pooling layer (we pool manually)
         self.encoder = AutoModel.from_pretrained(model_name, add_pooling_layer=False)
+        # Prefer FlashAttention v2 when available; fall back to SDPA. Quality is unchanged, kernels are faster.
+        try:
+            if torch.cuda.is_available():
+                _fa_ok = False
+                try:
+                    import flash_attn  # noqa: F401
+                    _fa_ok = True
+                except Exception:
+                    _fa_ok = False
+                if _fa_ok and hasattr(self.encoder, 'config') and hasattr(self.encoder.config, 'attn_implementation'):
+                    # Transformers will validate head size/dtypes; if unsupported it will raise and we'll ignore.
+                    try:
+                        setattr(self.encoder.config, 'attn_implementation', 'flash_attention_2')
+                    except Exception:
+                        # Fall back to SDPA below
+                        setattr(self.encoder.config, 'attn_implementation', 'sdpa')
+                elif hasattr(self.encoder, 'config') and hasattr(self.encoder.config, 'attn_implementation'):
+                    setattr(self.encoder.config, 'attn_implementation', 'sdpa')
+        except Exception:
+            pass
         
         hidden_dim = config.hidden_size
 
@@ -356,9 +406,10 @@ class ContrastiveBookMatcher(nn.Module):
         Returns:
             loss, logits
         """
-        # Encode both texts
-        emb1 = self.encoder(input_ids_1, attention_mask=attention_mask_1).last_hidden_state
-        emb2 = self.encoder(input_ids_2, attention_mask=attention_mask_2).last_hidden_state
+        # Encode both texts. Use SDPA preferences if supported to favor flash/mem-efficient kernels on H100/H200.
+        with _fast_sdpa_ctx():
+            emb1 = self.encoder(input_ids_1, attention_mask=attention_mask_1).last_hidden_state
+            emb2 = self.encoder(input_ids_2, attention_mask=attention_mask_2).last_hidden_state
 
         # Pool embeddings
         emb1_pooled = self._pool_embeddings(emb1, attention_mask_1)
@@ -423,7 +474,9 @@ class ContrastiveBookMatcher(nn.Module):
             emb1_norm = F.normalize(emb1_pooled, p=2, dim=1)
             emb2_norm = F.normalize(emb2_pooled, p=2, dim=1)
 
-            info_nce_loss = torch.tensor(0.0, device=logits.device)
+            # Ensure contrastive temperature participates in the graph on every step
+            # so DDP does not see it as an "unused" parameter on batches without positives.
+            info_nce_loss = (self.temperature.to(emb1_pooled.dtype) * 0.0).sum()
             pos_idx = (labels == 1).nonzero(as_tuple=False).squeeze(-1)
             if pos_idx.numel() > 0:
                 if self.contrastive_mode == 'supcon':
@@ -583,8 +636,13 @@ class ContrastiveTrainer(Trainer):
                 return torch.tensor(ints, device=labels.device, dtype=torch.long)
             except Exception:
                 return None
-        book_ids_1 = _hash_ids(b1)
-        book_ids_2 = _hash_ids(b2)
+        # Only needed for SupCon multi-positive semantics; skip hashing otherwise for a tiny CPU win
+        if getattr(model, 'contrastive_mode', '') == 'supcon' and (b1 is not None and b2 is not None):
+            book_ids_1 = _hash_ids(b1)
+            book_ids_2 = _hash_ids(b2)
+        else:
+            book_ids_1 = None
+            book_ids_2 = None
         outputs = model(**inputs, labels=labels, book_ids_1=book_ids_1, book_ids_2=book_ids_2)
         loss = outputs['loss']
         return (loss, outputs) if return_outputs else loss
@@ -622,8 +680,12 @@ class DistillContrastiveTrainer(Trainer):
                 return torch.tensor(ints, device=labels.device, dtype=torch.long)
             except Exception:
                 return None
-        book_ids_1 = _hash_ids(b1)
-        book_ids_2 = _hash_ids(b2)
+        if getattr(model, 'contrastive_mode', '') == 'supcon' and (b1 is not None and b2 is not None):
+            book_ids_1 = _hash_ids(b1)
+            book_ids_2 = _hash_ids(b2)
+        else:
+            book_ids_1 = None
+            book_ids_2 = None
         outputs = model(**inputs, labels=labels, book_ids_1=book_ids_1, book_ids_2=book_ids_2)
         loss = outputs['loss']
 
@@ -720,6 +782,99 @@ class AdversarySchedulerCallback(TrainerCallback):
         self.model.grl_scale = float(self.max_grl_scale) * s
 
 
+class PerfLoggerCallback(TrainerCallback):
+    """Lightweight per-step performance logger.
+
+    - Estimates data loading time as time between last step end and current step begin.
+    - Measures step compute time as time between step begin and end (forward+backward+optimizer).
+    - Logs smoothed averages every N steps on rank 0 only to avoid spam.
+    """
+
+    def __init__(self, print_every: int = 50) -> None:
+        super().__init__()
+        self.print_every = max(1, int(print_every))
+        self._last_end_t: float | None = None
+        self._step_start_t: float | None = None
+        self._ema_data: float | None = None
+        self._ema_step: float | None = None
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        # Hardware + run summary (rank 0)
+        is_w0 = getattr(state, "is_world_process_zero", False)
+        if is_w0:
+            try:
+                ws = int(os.environ.get("WORLD_SIZE", "1"))
+            except Exception:
+                ws = 1
+            try:
+                rk = int(os.environ.get("RANK", "0"))
+            except Exception:
+                rk = 0
+            gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+            devs = []
+            for i in range(gpus):
+                try:
+                    devs.append(torch.cuda.get_device_name(i))
+                except Exception:
+                    devs.append("cuda")
+            print({
+                "world_size": ws,
+                "rank": rk,
+                "gpus": gpus,
+                "devices": devs,
+                "bf16": bool(getattr(args, "bf16", False)),
+                "fp16": bool(getattr(args, "fp16", False)),
+                "dl_workers": int(getattr(args, "dataloader_num_workers", 0)),
+                "batch_per_device": int(getattr(args, "per_device_train_batch_size", 0)),
+                "grad_accum": int(getattr(args, "gradient_accumulation_steps", 1)),
+                "max_steps": (int(getattr(state, "max_steps", 0)) if getattr(state, "max_steps", None) is not None else None),
+            })
+        self._last_end_t = time.perf_counter()
+
+    def on_step_begin(self, args, state, control, **kwargs):
+        now = time.perf_counter()
+        if self._last_end_t is not None:
+            data_t = now - self._last_end_t
+            # EMA smoothing
+            if self._ema_data is None:
+                self._ema_data = data_t
+            else:
+                self._ema_data = 0.9 * self._ema_data + 0.1 * data_t
+        self._step_start_t = now
+
+    def on_step_end(self, args, state, control, **kwargs):
+        now = time.perf_counter()
+        if self._step_start_t is not None:
+            step_t = now - self._step_start_t
+            if self._ema_step is None:
+                self._ema_step = step_t
+            else:
+                self._ema_step = 0.9 * self._ema_step + 0.1 * step_t
+        self._last_end_t = now
+        # Rank 0 logging
+        if getattr(state, "is_world_process_zero", False):
+            gs = getattr(state, "global_step", 0)
+            if int(gs) % self.print_every == 0 and self._ema_step is not None:
+                data_ms = (self._ema_data or 0.0) * 1000.0
+                step_ms = self._ema_step * 1000.0
+                total_ms = data_ms + step_ms
+                it_s = 1000.0 / total_ms if total_ms > 0 else 0.0
+                # Optional CUDA memory snapshot for GPU 0
+                gpu_mem_gb = None
+                if torch.cuda.is_available():
+                    try:
+                        gpu_mem_gb = torch.cuda.max_memory_allocated() / (1024**3)
+                    except Exception:
+                        gpu_mem_gb = None
+                print({
+                    "step": int(gs),
+                    "it_per_s": round(it_s, 3),
+                    "data_ms": round(data_ms, 1),
+                    "compute_ms": round(step_ms, 1),
+                    "gpu0_mem_GB": (round(gpu_mem_gb, 2) if gpu_mem_gb is not None else None),
+                })
+
+
 class ContrastiveWeightSchedulerCallback(TrainerCallback):
     """Linearly ramp the contrastive loss weight from its initial value to a final target.
 
@@ -760,20 +915,20 @@ class ContrastiveWeightSchedulerCallback(TrainerCallback):
         self.model.contrastive_weight = float(target)
 
 
-def tokenize_pair(examples, tokenizer, max_length: int = 512):
+def tokenize_pair(examples, tokenizer, max_length: int = 512, dynamic_padding: bool = True):
     """Tokenize pairs of texts separately for Siamese architecture."""
     # Tokenize both texts
     encoded1 = tokenizer(
         examples['text1'],
         truncation=True,
-        padding='max_length',
+        padding=(False if dynamic_padding else 'max_length'),
         max_length=max_length
     )
     
     encoded2 = tokenizer(
         examples['text2'],
         truncation=True,
-        padding='max_length',
+        padding=(False if dynamic_padding else 'max_length'),
         max_length=max_length
     )
     
@@ -1058,6 +1213,77 @@ class SiameseDataCollator:
         elif 'label' in features[0]:
             batch['labels'] = torch.tensor([f['label'] for f in features], dtype=torch.long)
 
+
+class SiameseDynamicPaddingCollator:
+    """Collator that pads each side of the siamese pair to the longest length in the batch.
+
+    Uses the provided tokenizer's .pad to build two padded tensors: one for side 1 and one for side 2.
+    Keeps auxiliary fields (style/topic/text/book/labels) consistent with SiameseDataCollator.
+    """
+
+    def __init__(self, tokenizer, pad_to_multiple_of: int | None = None):
+        self.tokenizer = tokenizer
+        self.pad_to_multiple_of = pad_to_multiple_of
+
+    def __call__(self, features: List[Dict]):
+        import torch
+        # Prepare lists for each side
+        to_pad_1 = [
+            {
+                'input_ids': f['input_ids_1'],
+                'attention_mask': f['attention_mask_1'],
+            }
+            for f in features
+        ]
+        to_pad_2 = [
+            {
+                'input_ids': f['input_ids_2'],
+                'attention_mask': f['attention_mask_2'],
+            }
+            for f in features
+        ]
+        # Pad with tokenizer (longest in batch)
+        pad_kwargs = dict(padding=True, return_tensors='pt')
+        if self.pad_to_multiple_of is not None:
+            pad_kwargs['pad_to_multiple_of'] = int(self.pad_to_multiple_of)
+        b1 = self.tokenizer.pad(to_pad_1, **pad_kwargs)
+        b2 = self.tokenizer.pad(to_pad_2, **pad_kwargs)
+
+        batch = {
+            'input_ids_1': b1['input_ids'],
+            'attention_mask_1': b1['attention_mask'],
+            'input_ids_2': b2['input_ids'],
+            'attention_mask_2': b2['attention_mask'],
+        }
+
+        # Style features (float32)
+        for key in ['style_features_1', 'style_features_2']:
+            if key in features[0]:
+                batch[key] = torch.tensor([f[key] for f in features], dtype=torch.float32)
+
+        # Topic labels (long), if present
+        if 'topic1' in features[0] and 'topic2' in features[0]:
+            batch['topic_labels_1'] = torch.tensor([f['topic1'] for f in features], dtype=torch.long)
+            batch['topic_labels_2'] = torch.tensor([f['topic2'] for f in features], dtype=torch.long)
+
+        # Raw text for distillation (list[str])
+        if 'text1' in features[0] and 'text2' in features[0]:
+            batch['text1'] = [f['text1'] for f in features]
+            batch['text2'] = [f['text2'] for f in features]
+
+        # Optional book ids as lists of strings
+        if 'book1' in features[0] and 'book2' in features[0]:
+            batch['book1'] = [f.get('book1', '') for f in features]
+            batch['book2'] = [f.get('book2', '') for f in features]
+
+        # Labels
+        if 'labels' in features[0]:
+            batch['labels'] = torch.tensor([f['labels'] for f in features], dtype=torch.long)
+        elif 'label' in features[0]:
+            batch['labels'] = torch.tensor([f['label'] for f in features], dtype=torch.long)
+
+        return batch
+
         return batch
 
 
@@ -1084,8 +1310,8 @@ def train_contrastive(
     grad_accum_steps: int = 2,
     weight_decay: float = 0.01,
     select_metric: str = 'balanced_accuracy',
-    max_length: int = 512,
-    grad_checkpointing: bool = True,
+    max_length: int = 384,
+    grad_checkpointing: Optional[bool] = None,
     teacher_on_gpu: bool | None = None,
     classifier: str = 'arcface',
     arcface_margin: float = 0.25,
@@ -1104,8 +1330,31 @@ def train_contrastive(
     multi_head_adversary: bool = False,
     use_independence_penalty: bool = False,
     independence_weight: float = 0.0,
+    # Tokenization parallelism for HF datasets.map (None -> use all available cores)
+    tokenize_workers: int | None = None,
+    # Training/eval control
+    eval_strategy: str = 'epoch',
+    eval_steps: int = 500,
+    save_strategy: str = 'epoch',
+    save_steps: int = 500,
+    logging_steps: int = 100,
+    eval_subset_size: Optional[int] = None,
+    disable_distillation: bool = True,
+    # Dynamic padding per-batch to reduce wasted compute
+    dynamic_padding: bool = True,
+    # Optional on-disk tokenized dataset cache directory
+    tokenized_cache_dir: Optional[str] = None,
+    # Larger eval batch for faster evaluations (multiplier of train batch)
+    eval_batch_multiplier: int = 2,
+    # Optional: torch.compile for extra speed (can increase startup time)
+    compile_model: bool = False,
+    # Optional: auto-scale LR with global batch (linear rule, conservative)
+    auto_scale_lr: bool = False,
 ):
     """Train the contrastive model."""
+    # Distributed defaults; avoid over-constraining CUDA connection settings
+    os.environ.setdefault('NCCL_ASYNC_ERROR_HANDLING', '1')
+    os.environ.setdefault('NCCL_DEBUG', os.environ.get('NCCL_DEBUG', 'WARN'))
     print(f"Loading datasets from {data_dir}...")
     from datasets import load_from_disk
     datasets = load_from_disk(data_dir)
@@ -1116,13 +1365,78 @@ def train_contrastive(
     print(f"Loading model and tokenizer: {model_name}")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     
-    # Tokenize datasets
-    print("Tokenizing datasets...")
-    tokenized_datasets = datasets.map(
-        lambda x: tokenize_pair(x, tokenizer, max_length=max_length),
-        batched=True,
-        remove_columns=[]
-    )
+    # Tokenize datasets (DDP-aware, cached to disk to avoid duplicate work across ranks)
+    import os as _os
+    from datasets import load_from_disk as _load_from_disk
+    # Determine DDP context
+    try:
+        world_size = int(_os.environ.get('WORLD_SIZE', '1'))
+        rank = int(_os.environ.get('RANK', '0'))
+    except Exception:
+        world_size, rank = 1, 0
+    # Resolve workers
+    try:
+        auto_workers = max(1, int(_os.cpu_count() or 1))
+    except Exception:
+        auto_workers = 1
+    # Allow env override
+    env_tok = _os.environ.get('TOKENIZE_WORKERS')
+    num_workers = auto_workers if (tokenize_workers is None or int(tokenize_workers) <= 0) else int(tokenize_workers)
+    if env_tok is not None:
+        try:
+            num_workers = max(1, int(env_tok))
+        except Exception:
+            pass
+    # Cache path
+    if tokenized_cache_dir:
+        cache_dir = tokenized_cache_dir
+    else:
+        base = '/vol/data/tokenized' if _os.path.exists('/vol') else 'data/tokenized'
+        _os.makedirs(base, exist_ok=True)
+        model_slug = str(model_name).replace('/', '-').replace(':', '-')
+        cache_dir = _os.path.join(base, f'{model_slug}-len{int(max_length)}-dynpad{int(bool(dynamic_padding))}')
+    sentinel = _os.path.join(cache_dir, '_SUCCESS')
+    # Attempt to load from cache
+    tokenized_datasets = None
+    if _os.path.exists(cache_dir):
+        try:
+            tokenized_datasets = _load_from_disk(cache_dir)
+            print(f"Loaded tokenized datasets from cache: {cache_dir}")
+        except Exception:
+            tokenized_datasets = None
+    if tokenized_datasets is None:
+        if rank == 0:
+            print("Tokenizing datasets...")
+            print(f"Tokenization workers: {num_workers} (auto={auto_workers})")
+            tokenized_datasets = datasets.map(
+                lambda x: tokenize_pair(x, tokenizer, max_length=max_length, dynamic_padding=bool(dynamic_padding)),
+                batched=True,
+                remove_columns=[],
+                num_proc=max(1, int(num_workers))
+            )
+            # Save to cache for other ranks/future runs
+            try:
+                tokenized_datasets.save_to_disk(cache_dir)
+                # Write sentinel
+                try:
+                    with open(sentinel, 'w') as _f:
+                        _f.write('ok')
+                except Exception:
+                    pass
+                print(f"Saved tokenized datasets to {cache_dir}")
+            except Exception as _e:
+                print(f"Warning: failed to save tokenized datasets cache: {_e}")
+        else:
+            # Wait for rank 0 to finish
+            import time as _time
+            print(f"Rank {rank} waiting for tokenized cache at {cache_dir} ...")
+            waited = 0
+            while waited < 60 * 60 * 6:  # up to 6 hours
+                if _os.path.exists(sentinel) or _os.path.exists(_os.path.join(cache_dir, 'dataset_info.json')):
+                    break
+                _time.sleep(5)
+                waited += 5
+            tokenized_datasets = _load_from_disk(cache_dir)
     # Leave features as lists; collator will convert to tensors
     
     # Compute class weights from training labels if dataset is imbalanced
@@ -1163,19 +1477,55 @@ def train_contrastive(
         supcon_temperature=supcon_temperature,
     )
     # Reduce memory footprint where possible
+    # Prefer non-reentrant gradient checkpointing on multi-GPU (safe with shared encoder)
+    try:
+        _ws_env = int(os.environ.get('WORLD_SIZE', '1'))
+    except Exception:
+        _ws_env = 1
+    if grad_checkpointing is None:
+        # Default: off for multi-GPU (throughput), on for single-GPU (memory saver)
+        grad_ckpt_effective = (_ws_env <= 1)
+    else:
+        grad_ckpt_effective = bool(grad_checkpointing)
+
     try:
         # Disable cache for training
         if hasattr(model, 'encoder') and hasattr(model.encoder, 'config'):
             setattr(model.encoder.config, 'use_cache', False)
-        # Enable gradient checkpointing on the encoder if available
-        if grad_checkpointing and hasattr(model, 'encoder') and hasattr(model.encoder, 'gradient_checkpointing_enable'):
-            model.encoder.gradient_checkpointing_enable()
-        elif (not grad_checkpointing) and hasattr(model, 'encoder') and hasattr(model.encoder, 'gradient_checkpointing_disable'):
+            # Prefer FlashAttention v2 if already selected; otherwise fall back to SDPA
+            try:
+                if hasattr(model.encoder.config, 'attn_implementation'):
+                    cur = getattr(model.encoder.config, 'attn_implementation', None)
+                    if cur not in ('flash_attention_2',):
+                        setattr(model.encoder.config, 'attn_implementation', 'sdpa')
+            except Exception:
+                pass
+        # Enable gradient checkpointing on the encoder (non-reentrant when supported)
+        if grad_ckpt_effective and hasattr(model, 'encoder') and hasattr(model.encoder, 'gradient_checkpointing_enable'):
+            try:
+                # Available in recent transformers/torch
+                model.encoder.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+                if _ws_env > 1:
+                    print(f"Enabled non-reentrant gradient checkpointing (WORLD_SIZE={_ws_env}).")
+            except TypeError:
+                # Older versions: fall back. Reentrant can break under DDP with a shared module.
+                if _ws_env > 1:
+                    model.encoder.gradient_checkpointing_disable()
+                    grad_ckpt_effective = False
+                    print(f"Disabled gradient checkpointing for multi-GPU DDP (WORLD_SIZE={_ws_env}); non-reentrant not supported.")
+                else:
+                    model.encoder.gradient_checkpointing_enable()
+            except Exception as _e:
+                if _ws_env > 1:
+                    model.encoder.gradient_checkpointing_disable()
+                    grad_ckpt_effective = False
+                    print(f"Gradient checkpointing setup failed under DDP: {_e}. Disabled for safety.")
+        elif hasattr(model, 'encoder') and hasattr(model.encoder, 'gradient_checkpointing_disable'):
             model.encoder.gradient_checkpointing_disable()
     except Exception:
         pass
     
-    # Speed settings on Ampere+ GPUs
+    # Speed settings on Ampere/Hopper GPUs
     if torch.cuda.is_available():
         try:
             torch.backends.cuda.matmul.allow_tf32 = True
@@ -1184,36 +1534,78 @@ def train_contrastive(
         except Exception:
             pass
 
+    # Optional compilation (can improve throughput 5-20%; increases warmup)
+    if compile_model and torch.cuda.is_available():
+        try:
+            model = torch.compile(model, mode='reduce-overhead')
+            print("Enabled torch.compile(mode='reduce-overhead')")
+        except Exception as e:
+            print(f"torch.compile skipped: {e}")
+
     # Training arguments
     bf16_ok = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     # Important: set gradient_checkpointing=False here because our model is a custom nn.Module
     # and HF Trainer will try to call model.gradient_checkpointing_enable() if this is True.
     # We already handle enabling checkpointing directly on the encoder above when requested.
+    # Adapt dataloader workers to world size to avoid CPU oversubscription in DDP
+    try:
+        cpu_ct = max(1, int(_os.cpu_count() or 1))
+    except Exception:
+        cpu_ct = 8
+    dl_workers = max(2, cpu_ct // max(1, world_size))
+    # Optionally scale LR linearly with effective global batch (conservative baseline = 128)
+    if auto_scale_lr:
+        try:
+            world_size = int(os.environ.get('WORLD_SIZE', '1'))
+        except Exception:
+            world_size = 1
+        eff_global_batch = int(batch_size) * max(1, world_size) * max(1, int(grad_accum_steps))
+        base = 128
+        scaled_lr = float(learning_rate) * (eff_global_batch / float(base))
+    else:
+        scaled_lr = float(learning_rate)
+
+    # Ensure HF Trainer picks up torchrun distributed launch when created programmatically
+    try:
+        _local_rank_env = int(os.environ.get('LOCAL_RANK', '-1'))
+    except Exception:
+        _local_rank_env = -1
+
     training_args = TrainingArguments(
         output_dir=output_dir,
         num_train_epochs=num_epochs,
         per_device_train_batch_size=batch_size,
-        per_device_eval_batch_size=batch_size,
-        learning_rate=learning_rate,
+        per_device_eval_batch_size=max(batch_size * max(1, int(eval_batch_multiplier)), 32),
+        learning_rate=scaled_lr,
         warmup_steps=warmup_steps,
         weight_decay=weight_decay,
         max_grad_norm=1.0,
         logging_dir=f'{output_dir}/logs',
-        logging_steps=100,
-        eval_strategy='steps',
-        eval_steps=500,
-        save_strategy='steps',
-        save_steps=500,
+        logging_steps=int(logging_steps),
+        eval_strategy=str(eval_strategy),
+        eval_steps=int(eval_steps),
+        save_strategy=str(save_strategy),
+        save_steps=int(save_steps),
         load_best_model_at_end=True,
         metric_for_best_model=select_metric,
         greater_is_better=True,
         report_to='none',
         fp16=(torch.cuda.is_available() and not bf16_ok),
         bf16=bf16_ok,
-        dataloader_num_workers=8,
+        dataloader_num_workers=int(dl_workers),
+        dataloader_pin_memory=True,
+        dataloader_persistent_workers=True,
         remove_unused_columns=False,
         gradient_accumulation_steps=grad_accum_steps,
         gradient_checkpointing=False,
+        # Distributed config
+        local_rank=_local_rank_env,
+        # DDP settings: no unused params detected in forward; disable extra autograd traversal.
+        ddp_find_unused_parameters=False,
+        ddp_broadcast_buffers=False,
+        ddp_backend="nccl",
+        ddp_bucket_cap_mb=100,
+        optim=("adamw_torch_fused" if torch.cuda.is_available() else "adamw_torch"),
     )
     
     # Create trainer
@@ -1233,13 +1625,32 @@ def train_contrastive(
             teacher_model = None
             teacher_tokenizer = None
 
+    # Allow disabling distillation for speed
+    if disable_distillation:
+        teacher_model = None
+        teacher_tokenizer = None
+
+    # Optionally use a smaller validation subset for frequent step-wise evals to reduce overhead
+    eval_ds = tokenized_datasets['validation']
+    if eval_strategy == 'steps' and eval_subset_size is not None:
+        try:
+            n = int(eval_subset_size)
+            if n > 0 and n < len(eval_ds):
+                eval_ds = eval_ds.shuffle(seed=42).select(range(n))
+                print(f"Using eval subset of size {n} for step-wise evaluation; full validation is used at the end.")
+        except Exception as _e:
+            print(f"Warning: could not subset eval set: {_e}")
+
+    # Prefer padding to multiples of 16 on GPU for better kernel efficiency
+    _pad_mul = 16 if (dynamic_padding and torch.cuda.is_available()) else 8
     if teacher_model is not None:
+        collator = SiameseDynamicPaddingCollator(tokenizer, pad_to_multiple_of=_pad_mul) if dynamic_padding else SiameseDataCollator()
         trainer = DistillContrastiveTrainer(
             model=model,
             args=training_args,
             train_dataset=tokenized_datasets['train'],
-            eval_dataset=tokenized_datasets['validation'],
-            data_collator=SiameseDataCollator(),
+            eval_dataset=eval_ds,
+            data_collator=collator,
             compute_metrics=compute_metrics,
             callbacks=[
                 EarlyStoppingCallback(early_stopping_patience=3),
@@ -1256,6 +1667,7 @@ def train_contrastive(
                     warmup_ratio=max(0.0, adv_warmup_ratio / 2),
                     ramp_ratio=adv_ramp_ratio,
                 ),
+                PerfLoggerCallback(print_every=max(10, int(logging_steps))),
             ],
             teacher_model=teacher_model,
             teacher_tokenizer=teacher_tokenizer,
@@ -1263,12 +1675,13 @@ def train_contrastive(
             distill_temperature=distill_temperature,
         )
     else:
+        collator = SiameseDynamicPaddingCollator(tokenizer, pad_to_multiple_of=_pad_mul) if dynamic_padding else SiameseDataCollator()
         trainer = ContrastiveTrainer(
             model=model,
             args=training_args,
             train_dataset=tokenized_datasets['train'],
-            eval_dataset=tokenized_datasets['validation'],
-            data_collator=SiameseDataCollator(),
+            eval_dataset=eval_ds,
+            data_collator=collator,
             compute_metrics=compute_metrics,
             callbacks=[
                 EarlyStoppingCallback(early_stopping_patience=3),
@@ -1285,6 +1698,7 @@ def train_contrastive(
                     warmup_ratio=max(0.0, adv_warmup_ratio / 2),
                     ramp_ratio=adv_ramp_ratio,
                 ),
+                PerfLoggerCallback(print_every=max(10, int(logging_steps))),
             ],
         )
     # Ensure only the primary 'labels' are used for metrics/label_ids
@@ -1304,6 +1718,7 @@ def train_contrastive(
 
     # Calibration: temperature scaling and threshold selection on validation logits
     print("\nCalibrating on validation set...")
+    # Always compute calibration on the full validation set
     val_pred = trainer.predict(tokenized_datasets['validation'])
     val_logits = _extract_logits_np(val_pred.predictions)
     val_labels = val_pred.label_ids
@@ -1333,7 +1748,7 @@ def train_contrastive(
 
 if __name__ == '__main__':
     import argparse
-    
+
     parser = argparse.ArgumentParser(description='Train contrastive book-text matching model')
     parser.add_argument('--model', type=str, default='roberta-large', help='Base model name')
     parser.add_argument('--output', type=str, default='models/book_matcher_contrastive', 
@@ -1354,6 +1769,8 @@ if __name__ == '__main__':
     parser.add_argument('--no-projection', action='store_true', help='Disable projection head before classifier')
     parser.add_argument('--label-smoothing', type=float, default=0.03, help='Label smoothing in CE loss')
     parser.add_argument('--grad-accum', type=int, default=2, help='Gradient accumulation steps')
+    parser.add_argument('--grad-ckpt', action='store_true', help='Enable gradient checkpointing (save memory, slower)')
+    parser.add_argument('--no-grad-ckpt', action='store_true', help='Disable gradient checkpointing (maximize tokens/s)')
     parser.add_argument('--weight-decay', type=float, default=0.01, help='AdamW weight decay')
     parser.add_argument('--select-metric', type=str, default='balanced_accuracy', choices=['accuracy','balanced_accuracy','f1','precision','recall','auc','pr_auc'], help='Metric used to select best checkpoint')
     parser.add_argument('--classifier', type=str, default='arcface', choices=['mlp','arcface'], help='Classifier type for final decision')
@@ -1373,6 +1790,9 @@ if __name__ == '__main__':
     # Independence penalty
     parser.add_argument('--independence-penalty', action='store_true', help='Add HSIC penalty to reduce dependence on topic labels')
     parser.add_argument('--independence-weight', type=float, default=0.0, help='Weight for HSIC independence penalty')
+    # Efficiency knobs (safe): torch.compile and max length
+    parser.add_argument('--compile', dest='compile_model', action='store_true', help='Enable torch.compile for faster training (no quality change)')
+    parser.add_argument('--max-length', type=int, default=384, help='Max tokens per side (affects speed but not model capacity)')
     
     args = parser.parse_args()
     
@@ -1383,6 +1803,7 @@ if __name__ == '__main__':
         num_epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.lr,
+        max_length=args.max_length,
         use_style_features=not args.no_style_features,
         use_symmetric_features=args.symmetric_head,
         contrastive_weight=args.contrastive_weight,
@@ -1396,6 +1817,7 @@ if __name__ == '__main__':
         use_projection=(not args.no_projection),
         label_smoothing=args.label_smoothing,
         grad_accum_steps=args.grad_accum,
+        grad_checkpointing=(True if args.grad_ckpt else (False if args.no_grad_ckpt else None)),
         weight_decay=args.weight_decay,
         select_metric=args.select_metric,
         classifier=args.classifier,
@@ -1411,4 +1833,5 @@ if __name__ == '__main__':
         multi_head_adversary=args.multi_head_adversary,
         use_independence_penalty=args.independence_penalty,
         independence_weight=args.independence_weight,
+        compile_model=getattr(args, 'compile_model', False),
     )

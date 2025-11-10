@@ -74,6 +74,14 @@ def _brier(probs: np.ndarray, y: np.ndarray) -> float:
 
 def _load_pairs_csv(path: str) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
+    # Increase CSV field size limit to accommodate long excerpts/outputs
+    try:
+        csv.field_size_limit(2 ** 31 - 1)
+    except Exception:
+        try:
+            csv.field_size_limit(10_000_000)
+        except Exception:
+            pass
     with open(path, newline='', encoding='utf-8') as f:
         reader = csv.DictReader(f)
         for r in reader:
