@@ -109,11 +109,8 @@ def _process_book_worker(job):
         if chunks:
             if len(chunks) > max_chunks_per_book:
                 chunks = random.sample(chunks, max_chunks_per_book)
-            md = {}
-            if use_hard_negatives:
-                sample_text = ' '.join(chunks[:min(10, len(chunks))])
-                md = infer_book_metadata(sample_text)
-            return ("ok", book_id, chunks, md)
+            # Metadata-based negatives removed; return empty metadata
+            return ("ok", book_id, chunks, {})
         return ("empty", book_id, [], {})
     except Exception as e:
         try:
@@ -199,40 +196,7 @@ def _is_anonymous_author(author_slug: str) -> bool:
     return False
 
 
-def infer_book_metadata(book_text: str) -> Dict[str, str]:
-    """Infer metadata from book content for hard negative mining."""
-    # Try to extract author, period, genre hints from text
-    metadata = {
-        'period': 'unknown',
-        'genre': 'unknown',
-        'style': 'unknown'
-    }
-    
-    text_lower = book_text.lower()
-    
-    # Period detection (very basic)
-    if any(word in text_lower for word in ['thou', 'thy', 'thee', 'hath', 'doth']):
-        metadata['period'] = 'archaic'
-    elif any(word in text_lower for word in ['thine', 'whilst', 'whither']):
-        metadata['period'] = 'early_modern'
-    elif any(word in text_lower for word in ['wherefore', 'prithee']):
-        metadata['period'] = 'shakespearean'
-    else:
-        metadata['period'] = 'modern'
-    
-    # Genre detection (very basic)
-    if any(word in text_lower for word in ['god', 'church', 'prayer', 'scripture']):
-        metadata['genre'] = 'religious'
-    elif any(word in text_lower for word in ['prince', 'king', 'castle', 'knight', 'lord']):
-        metadata['genre'] = 'historical'
-    elif any(word in text_lower for word in ['captain', 'ship', 'sea', 'voyage', 'island']):
-        metadata['genre'] = 'adventure'
-    elif any(word in text_lower for word in ['love', 'heart', 'soul', 'passion']):
-        metadata['genre'] = 'romance'
-    else:
-        metadata['genre'] = 'general'
-    
-    return metadata
+# Removed: metadata inference for negatives
 
 
 def prepare_datasets(
@@ -257,7 +221,7 @@ def prepare_datasets(
     n_mined_trials: int = 200,
     n_mined_keep: int = 20,
     # Optional: ANN chunk-level hard negatives via contrastive embeddings
-    # EXPERIMENTAL: this may be removed later.
+    # GPU-friendly two-stage miner (restricted to neighbor books)
     use_ann_chunk_negatives: bool = False,
     ann_miner_model_dir: Optional[str] = None,
     ann_k_neighbors: int = 20,
@@ -300,7 +264,6 @@ def prepare_datasets(
     
     # Process books into chunks (parallel by default)
     book_chunks: Dict[str, List[str]] = {}
-    book_metadata: Dict[str, Dict[str, str]] = {}
     # Resolve worker count (auto: up to 32 or CPU count)
     try:
         auto_workers = min(os.cpu_count() or 8, 32)
@@ -324,8 +287,7 @@ def prepare_datasets(
                 done += 1
                 if status == "ok":
                     book_chunks[bid] = chunks
-                    if use_hard_negatives and md:
-                        book_metadata[bid] = md
+                    # no metadata collection
                     print(f"  {bid}: {len(chunks)} chunks")
                 elif status == "error":
                     print(f"Error processing {bid}: {md}")
@@ -343,9 +305,7 @@ def prepare_datasets(
                     if len(chunks) > max_chunks_per_book:
                         chunks = random.sample(chunks, max_chunks_per_book)
                     book_chunks[book_id] = chunks
-                    if use_hard_negatives:
-                        sample_text = ' '.join(chunks[:min(10, len(chunks))])
-                        book_metadata[book_id] = infer_book_metadata(sample_text)
+                    # no metadata collection
                     print(f"  {book_id}: {len(chunks)} chunks")
             except Exception as e:
                 print(f"Error processing {book_id}: {e}")
@@ -515,7 +475,6 @@ def prepare_datasets(
             # Negative pairs (tiered hardness):
             # - author_same: same author, different book (very hard)
             # - embed_neighbor: nearest by embeddings (hard)
-            # - metadata_similar: same inferred period (medium)
             # - random: random different book (easy)
             easy_books = [bid for bid in book_set if bid != book_id]
             author_id = book_id.split('/', 1)[0] if '/' in book_id else ''
@@ -527,38 +486,33 @@ def prepare_datasets(
                 ]
             medium_books: List[str] = []
             hard_books: List[str] = []
-            neg_types = ['random', 'author_same', 'metadata_similar', 'embed_neighbor']
-            if use_hard_negatives and book_id in book_metadata:
-                md = book_metadata[book_id]
-                medium_books = [
-                    bid for bid in book_set
-                    if bid != book_id and book_metadata.get(bid, {}).get('period') == md.get('period')
-                ]
+            neg_types = ['random', 'author_same', 'embed_neighbor']
             if use_embedding_hard_negatives and book_neighbors.get(book_id):
                 hard_books = [b for b in book_neighbors.get(book_id, []) if b in book_set and b != book_id]
 
-            # Sampling weights favoring medium/hard but preserving some easy
-            # Favor author_same when available, then embed, then metadata, with some random
-            weights = [
-                0.15,  # random
-                0.35 if author_books else 0.0,  # author_same
-                0.25 if medium_books else 0.0,  # metadata_similar
-                0.25 if hard_books else 0.0,    # embed_neighbor
-            ]
-            # Normalize
-            s = sum(weights)
-            if s <= 0:
-                weights = [1.0, 0.0, 0.0]
+            # Random regularization + split remaining mass across available hard sources
+            rf = float(max(0.0, min(0.9, random_neg_frac)))
+            w_map = {k: 0.0 for k in neg_types}
+            if author_books and hard_books:
+                rem = 1.0 - rf
+                w_map['random'] = rf
+                w_map['author_same'] = rem / 2.0
+                w_map['embed_neighbor'] = rem / 2.0
+            elif author_books:
+                w_map['random'] = rf
+                w_map['author_same'] = 1.0 - rf
+            elif hard_books:
+                w_map['random'] = rf
+                w_map['embed_neighbor'] = 1.0 - rf
             else:
-                weights = [w / s for w in weights]
+                w_map['random'] = 1.0
+            weights = [w_map[t] for t in neg_types]
 
             # Create negative pairs
             for _ in range(n_negative_per_book):
                 choice = rng.choices(neg_types, weights=weights, k=1)[0]
                 if choice == 'embed_neighbor' and hard_books:
                     other_book_id = rng.choice(hard_books)
-                elif choice == 'metadata_similar' and medium_books:
-                    other_book_id = rng.choice(medium_books)
                 elif choice == 'author_same' and author_books:
                     other_book_id = rng.choice(author_books)
                 else:
@@ -661,45 +615,116 @@ def prepare_datasets(
                 except Exception as e:
                     print(f"Model-mined negatives skipped due to error: {e}")
         
-        # Experimental ANN-based chunk-level hard negatives (contrastive embeddings)
-        # NOTE: optional and conservative; may be removed later.
+        # GPU-friendly ANN per-book miner restricted to neighbor books
         if use_ann_chunk_negatives and book_set and ann_miner_model_dir:
             try:
-                from hard_negative_mining import (
-                    ContrastiveChunkEmbedder,
-                    MiningConfig,
-                    mine_ann_negatives,
-                )
-                subset_chunks = {bid: book_chunks[bid] for bid in book_set if bid in book_chunks}
-                embedder = ContrastiveChunkEmbedder(model_dir=ann_miner_model_dir)
-                cfg = MiningConfig(
-                    k_neighbors=ann_k_neighbors,
-                    sim_threshold=ann_sim_threshold,
-                    prob_max=ann_prob_max,
-                    anchors_per_book=ann_anchors_per_book,
-                    pool_samples_per_book=ann_pool_samples_per_book,
-                    batch_size=ann_batch_size,
-                    max_negatives_per_book=ann_max_negatives_per_book,
-                    max_total_negatives=ann_max_total_negatives,
-                )
-                mined = mine_ann_negatives(subset_chunks, embedder, cfg)
-                if mined:
-                    print(f"ANN mining added {len(mined)} additional hard negatives (experimental).")
-                    for ex in mined:
-                        s1, s2 = ex.get('text1',''), ex.get('text2','')
-                        t1 = _label_topic(s1)
-                        t2 = _label_topic(s2)
-                        ex['pair_type'] = 'negative'
-                        ex['neg_type'] = 'ann_mined'
-                        ex['topic1'] = int(t1)
-                        ex['topic2'] = int(t2)
-                        ex['same_topic'] = bool(t1 == t2)
-                        # best effort: we don't track originating books for ANN mined; leave book1/book2 empty
-                        ex.setdefault('book1', '')
-                        ex.setdefault('book2', '')
-                    pairs.extend(mined)
+                import torch  # type: ignore
+                from hard_negative_mining import ContrastiveChunkEmbedder
             except Exception as e:
-                print(f"ANN hard-negative mining skipped (experimental) due to error: {e}")
+                print(f"ANN mining unavailable (deps): {e}")
+            else:
+                try:
+                    embedder = ContrastiveChunkEmbedder(model_dir=ann_miner_model_dir)
+                except Exception as e:
+                    print(f"ANN embedder init failed: {e}")
+                    embedder = None
+                if embedder is not None:
+                    device = embedder.device if hasattr(embedder, 'device') else torch.device('cpu')
+                    total_ann = 0
+                    for book_id in list(book_set):
+                        try:
+                            anchors_src = book_chunks.get(book_id, [])
+                            if not anchors_src:
+                                continue
+                            # Sample anchors
+                            A = max(1, int(ann_anchors_per_book))
+                            if len(anchors_src) > A:
+                                idx = np.random.choice(len(anchors_src), size=A, replace=False)
+                                anchors = [anchors_src[i] for i in idx]
+                            else:
+                                anchors = list(anchors_src)
+                            # Gather pool from neighbor books (restricted)
+                            neigh_books = [b for b in (book_neighbors.get(book_id, []) or []) if b in book_set and b != book_id]
+                            if ann_k_neighbors > 0:
+                                neigh_books = neigh_books[: int(ann_k_neighbors)]
+                            pool_texts: List[str] = []
+                            pool_meta: List[str] = []  # neighbor book id per chunk
+                            per_nb = max(1, int(ann_pool_samples_per_book))
+                            for nb in neigh_books:
+                                chs = book_chunks.get(nb, [])
+                                if not chs:
+                                    continue
+                                if len(chs) > per_nb:
+                                    sel = np.random.choice(len(chs), size=per_nb, replace=False)
+                                    pts = [chs[i] for i in sel]
+                                else:
+                                    pts = list(chs)
+                                pool_texts.extend(pts)
+                                pool_meta.extend([nb] * len(pts))
+                            if not pool_texts:
+                                continue
+                            # Embed anchors and pool
+                            E_a = embedder.embed_texts(anchors, batch_size=max(8, int(ann_batch_size)))
+                            E_p = embedder.embed_texts(pool_texts, batch_size=max(8, int(ann_batch_size)))
+                            if E_a.size == 0 or E_p.size == 0:
+                                continue
+                            # Compute sims on GPU if available
+                            try:
+                                Ea = torch.from_numpy(E_a).to(device=device)
+                                Ep = torch.from_numpy(E_p).to(device=device)
+                                sims = Ea @ Ep.T
+                                sims_cpu = sims.detach().float().cpu().numpy()
+                                del sims
+                                if device.type == 'cuda':
+                                    torch.cuda.synchronize()
+                            except Exception:
+                                # CPU fallback
+                                sims_cpu = E_a @ E_p.T
+                            # Select candidates above threshold (top-1 per anchor)
+                            cand_pairs: List[Tuple[str, str, str]] = []  # (t1, t2, nb_book)
+                            for i in range(sims_cpu.shape[0]):
+                                row = sims_cpu[i]
+                                j = int(np.argmax(row))
+                                if float(row[j]) < float(ann_sim_threshold):
+                                    continue
+                                t1 = anchors[i]
+                                t2 = pool_texts[j]
+                                cand_pairs.append((t1, t2, pool_meta[j]))
+                            if not cand_pairs:
+                                continue
+                            # Rescore with model head and filter by prob_max
+                            pairs_infer = [(a, b) for (a, b, _nb) in cand_pairs]
+                            probs = embedder.pair_probs(pairs_infer, batch_size=max(8, int(ann_batch_size)))
+                            kept = 0
+                            for (t1, t2, nb), p in zip(cand_pairs, probs):
+                                if float(p) <= float(ann_prob_max):
+                                    t1t = _label_topic(t1)
+                                    t2t = _label_topic(t2)
+                                    pairs.append({
+                                        'text1': t1,
+                                        'text2': t2,
+                                        'label': 0,
+                                        'book1': book_id,
+                                        'book2': nb,
+                                        'pair_type': 'negative',
+                                        'neg_type': 'ann_mined',
+                                        'author1': (book_id.split('/',1)[0] if '/' in book_id else ''),
+                                        'author2': (nb.split('/',1)[0] if '/' in nb else ''),
+                                        'same_author': bool(('/' in book_id) and ('/' in nb) and (book_id.split('/',1)[0] == nb.split('/',1)[0])),
+                                        'topic1': int(t1t),
+                                        'topic2': int(t2t),
+                                        'same_topic': bool(t1t == t2t),
+                                    })
+                                    kept += 1
+                                    total_ann += 1
+                                    if kept >= int(ann_max_negatives_per_book):
+                                        break
+                            if ann_max_total_negatives is not None and total_ann >= int(ann_max_total_negatives):
+                                break
+                        except Exception:
+                            continue
+                    if total_ann > 0:
+                        print(f"ANN (GPU) mining added {total_ann} negatives.")
 
         return pairs
     
@@ -772,7 +797,7 @@ def chunk_books_to_jsonl(
     """
     files = [base_dir / p for p in rel_paths]
     book_chunks: Dict[str, List[str]] = {}
-    book_metadata: Dict[str, Dict[str, str]] = {}
+    # no metadata collection for shards
 
     # Resolve worker count
     try:
@@ -793,8 +818,7 @@ def chunk_books_to_jsonl(
                 status, bid, chunks, md = fut.result()
                 if status == "ok":
                     book_chunks[bid] = chunks
-                    if use_hard_negatives and md:
-                        book_metadata[bid] = md
+                    # no metadata collection
                 elif status == "error":
                     # Keep going; shard write should proceed
                     pass
@@ -809,13 +833,11 @@ def chunk_books_to_jsonl(
                     if len(chunks) > max_chunks_per_book:
                         chunks = random.sample(chunks, max_chunks_per_book)
                     book_chunks[bid] = chunks
-                    if use_hard_negatives:
-                        sample_text = ' '.join(chunks[:min(10, len(chunks))])
-                        book_metadata[bid] = infer_book_metadata(sample_text)
+                    # no metadata collection
             except Exception:
                 pass
 
-    _save_shard_jsonl(book_chunks, book_metadata, out_jsonl)
+    _save_shard_jsonl(book_chunks, {}, out_jsonl)
     return {"books": len(book_chunks), "chunks": sum(len(v) for v in book_chunks.values())}
 
 
@@ -1054,34 +1076,32 @@ def prepare_datasets_from_prechunked(
                 ]
             medium_books: List[str] = []
             hard_books: List[str] = []
-            neg_types = ['random', 'author_same', 'metadata_similar', 'embed_neighbor']
-            if use_hard_negatives and book_id in book_metadata:
-                md = book_metadata.get(book_id, {})
-                medium_books = [
-                    bid for bid in book_set
-                    if bid != book_id and book_metadata.get(bid, {}).get('period') == md.get('period')
-                ]
+            neg_types = ['random', 'author_same', 'embed_neighbor']
             if use_embedding_hard_negatives and (book_id in book_neighbors):
                 hard_books = [b for b in book_neighbors.get(book_id, []) if b in book_set and b != book_id]
 
-            weights = [
-                0.15,  # random
-                0.35 if author_books else 0.0,  # author_same
-                0.25 if medium_books else 0.0,  # metadata_similar
-                0.25 if hard_books else 0.0,    # embed_neighbor
-            ]
-            s = sum(weights)
-            if s <= 0:
-                weights = [1.0, 0.0, 0.0]
+            # Random regularization + split remaining mass across available hard sources
+            rf = float(max(0.0, min(0.9, random_neg_frac)))
+            w_map = {k: 0.0 for k in neg_types}
+            if author_books and hard_books:
+                rem = 1.0 - rf
+                w_map['random'] = rf
+                w_map['author_same'] = rem / 2.0
+                w_map['embed_neighbor'] = rem / 2.0
+            elif author_books:
+                w_map['random'] = rf
+                w_map['author_same'] = 1.0 - rf
+            elif hard_books:
+                w_map['random'] = rf
+                w_map['embed_neighbor'] = 1.0 - rf
             else:
-                weights = [w / s for w in weights]
+                w_map['random'] = 1.0
+            weights = [w_map[t] for t in neg_types]
 
             for _ in range(n_negative_per_book):
                 choice = rng.choices(neg_types, weights=weights, k=1)[0]
                 if choice == 'embed_neighbor' and hard_books:
                     other_book_id = rng.choice(hard_books)
-                elif choice == 'metadata_similar' and medium_books:
-                    other_book_id = rng.choice(medium_books)
                 elif choice == 'author_same' and author_books:
                     other_book_id = rng.choice(author_books)
                 else:

@@ -159,7 +159,7 @@ def prepare_remote(
     # ANN chunk-level hard negatives (EXPERIMENTAL)
     use_ann_chunk_negatives: bool = False,
     ann_miner_model_dir: str | None = None,
-    ann_k_neighbors: int = 20,
+    ann_k_neighbors: int = 50,
     ann_sim_threshold: float = 0.55,
     ann_prob_max: float = 0.20,
     ann_anchors_per_book: int = 120,
@@ -285,16 +285,16 @@ def prepare_remote_gpu(
     miner_model_dir: str | None = None,
     n_mined_trials: int = 200,
     n_mined_keep: int = 20,
-    # ANN chunk-level hard negatives (EXPERIMENTAL)
-    use_ann_chunk_negatives: bool = False,
-    ann_miner_model_dir: str | None = None,
+    # ANN chunk-level hard negatives (GPU two-stage; default on for GPU)
+    use_ann_chunk_negatives: bool = True,
+    ann_miner_model_dir: str | None = "/vol/models/book_matcher_contrastive/final",
     ann_k_neighbors: int = 20,
     ann_sim_threshold: float = 0.55,
     ann_prob_max: float = 0.20,
-    ann_anchors_per_book: int = 120,
-    ann_pool_samples_per_book: int = 200,
-    ann_batch_size: int = 32,
-    ann_max_negatives_per_book: int = 100,
+    ann_anchors_per_book: int = 40,
+    ann_pool_samples_per_book: int = 20,
+    ann_batch_size: int = 64,
+    ann_max_negatives_per_book: int = 40,
     ann_max_total_negatives: int | None = None,
 ):
     import random
