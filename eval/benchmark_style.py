@@ -82,6 +82,10 @@ def run_benchmark(
     max_tokens: int = 1200,
     concurrency: int = 3,
     stream_print: bool = True,
+    # Retry policy for empty/too-short generations
+    retry_empty: bool = True,
+    retry_attempts: int = 2,
+    min_chars: int = 50,
 ) -> Dict:
     """Run the style benchmark end-to-end and return results as a dict.
 
@@ -147,20 +151,41 @@ def run_benchmark(
 
     # 2) Generate in parallel (thread pool)
     def _do_generate(task: Dict) -> Dict:
-        try:
-            out = generate(
-                model=model,
-                prompt=task["prompt"],
-                system=system,
-                temperature=temperature,
-                top_p=top_p,
-                max_tokens=max_tokens,
-                seed=task["seed"],
-            )
-            ok = True
-        except LLMError as e:
-            out = f"[LLM ERROR] {e}"
-            ok = False
+        # Attempt generation, retrying on empty/too-short outputs if requested
+        attempts = max(0, int(retry_attempts)) if retry_empty else 0
+        rng_local = random.Random(task.get("seed", seed))
+        last_err: Exception | None = None
+        out: str = ""
+        ok: bool = False
+        for i in range(attempts + 1):
+            try:
+                s = task["seed"] if i == 0 else rng_local.randint(0, 2**31 - 1)
+                out_try = generate(
+                    model=model,
+                    prompt=task["prompt"],
+                    system=system,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_tokens=max_tokens,
+                    seed=s,
+                )
+                txt = (out_try or "").strip()
+                # Accept if long enough; else retry if allowed
+                if txt and len(txt) >= int(min_chars):
+                    out = txt
+                    ok = True
+                    break
+                out = txt  # keep last attempt even if short
+                ok = False
+            except LLMError as e:
+                last_err = e
+                out = f"[LLM ERROR] {e}"
+                ok = False
+                # On API error, continue to next attempt (may recover)
+                continue
+        # If we exhausted attempts and still too short or error, return best-effort result
+        if not ok and last_err is not None:
+            out = f"[LLM ERROR after {attempts+1} attempt(s)] {last_err}"
         return {**task, "output": out, "ok": ok}
 
     gen_results: List[Dict] = []

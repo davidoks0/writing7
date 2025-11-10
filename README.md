@@ -198,6 +198,67 @@ GPU guidance:
 
 ## Evaluation
 
+## Publish Trained Models to Hugging Face
+
+You already have the trained checkpoints; publish them so anyone can run the benchmark with your scorer.
+
+What to publish (from this repo):
+- Contrastive matcher (recommended metric): `models/book_matcher_contrastive/final` plus sibling files `calibration.json` and optional `style_calibration.json`.
+- Cross‑encoder baseline (optional): `models/book_matcher/final`.
+
+Two recommended model repos on the Hub (replace `your-org`):
+- `your-org/writing7-book-matcher-contrastive-v1` → upload the entire folder `models/book_matcher_contrastive/` so that the repo root contains `final/`, `calibration.json`, and (optionally) `style_calibration.json`.
+- `your-org/writing7-book-matcher-cross-encoder-v1` → upload the folder `models/book_matcher/` so that the repo root contains `final/`.
+
+Why this layout: our inference expects `--model_dir <path>/final` and reads calibration from the parent directory. Keeping `final/` as a subfolder in the Hub repo preserves this layout after a snapshot download.
+
+### One‑time setup
+1) `pip install huggingface_hub git-lfs`
+2) `huggingface-cli login` (paste your User or Org write token)
+
+### Push your models
+Use the helper script:
+
+```bash
+python scripts/push_to_hf.py \
+  --repo-id your-org/writing7-book-matcher-contrastive-v1 \
+  --source-dir models/book_matcher_contrastive
+
+python scripts/push_to_hf.py \
+  --repo-id your-org/writing7-book-matcher-cross-encoder-v1 \
+  --source-dir models/book_matcher
+```
+
+If your artifacts live in a Modal volume, first pull them locally, e.g.:
+
+```bash
+# Example: adjust volume name and paths as needed
+modal volume get writing7-artifacts /vol/models/book_matcher_contrastive ./models/book_matcher_contrastive
+modal volume get writing7-artifacts /vol/models/book_matcher ./models/book_matcher
+```
+
+### Let others download and run
+In any environment with the repo and a GPU:
+
+```bash
+pip install huggingface_hub
+python scripts/download_hf_model.py \
+  --repo-id your-org/writing7-book-matcher-contrastive-v1 \
+  --dest ./external/writing7-book-matcher-contrastive-v1
+
+# Run a small benchmark using the downloaded snapshot
+python -m eval.benchmark_style \
+  --model openai:gpt-4o-mini \
+  --book_path eval/books/gatsby.txt \
+  --n_excerpts 2 \
+  --n_samples 1 \
+  --model_dir ./external/writing7-book-matcher-contrastive-v1/final
+```
+
+Notes:
+- `eval/benchmark_style.py` uses the contrastive matcher locally and will automatically pick up `calibration.json` placed next to `final/`.
+- If you saved a `style_calibration.json`, place it alongside `calibration.json` before pushing. The scorer will use it when present to map cosine → [0,1].
+
 The model is evaluated on:
 - **Accuracy**: Overall correctness
 - **F1 Score**: Harmonic mean of precision and recall

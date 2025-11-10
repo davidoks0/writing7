@@ -8,6 +8,7 @@ tqdm>=4.65.0
 spacy>=3.7.0
 sentence-transformers>=2.2.2
 safetensors>=0.4.3
+huggingface_hub>=0.23.0
 openai>=1.43.0
 anthropic>=0.35.0
 google-generativeai>=0.7.2

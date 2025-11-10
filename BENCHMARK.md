@@ -78,6 +78,10 @@ modal run modal_app.py::benchmark_style -- --model anthropic:claude-3-5-sonnet-2
 ```
 Defaults: 1 sample per excerpt, across 5 different excerpts (5 total generations).
 
+Automatic empty-output retry
+- The benchmark retries empty or too-short generations (default: <50 chars) up to 2 extra attempts with new seeds.
+- Configure via flags in code: `retry_empty=True`, `retry_attempts=2`, `min_chars=50`.
+
 ## Is the description “divorced from topic” accurate?
 
 Mostly: the training explicitly discourages topic information in the representation via a GRL topic adversary and contrastive supervision across different topics, so the cosine reflects style rather than topical overlap. It is not perfectly topic‑free (no method is), but in practice we observe improved topic robustness versus naive embedding cosine.
