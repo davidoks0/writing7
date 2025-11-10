@@ -150,6 +150,7 @@ def prepare_remote(
     num_hard_negative_books: int = 50,
     n_positive_per_book: int = 20,
     n_negative_per_book: int = 40,
+    random_neg_frac: float = 0.10,
     # Model-mined negatives (optional; CPU-heavy)
     use_model_mined_negatives: bool = True,
     miner_model: str = 'contrastive',
@@ -233,6 +234,7 @@ def prepare_remote(
         num_hard_negative_books=num_hard_negative_books,
         n_positive_per_book=n_positive_per_book,
         n_negative_per_book=n_negative_per_book,
+        random_neg_frac=random_neg_frac,
         use_model_mined_negatives=use_model_mined_negatives,
         miner_model=miner_model,
         miner_model_dir=miner_model_dir,
@@ -279,6 +281,7 @@ def prepare_remote_gpu(
     num_hard_negative_books: int = 50,
     n_positive_per_book: int = 20,
     n_negative_per_book: int = 40,
+    random_neg_frac: float = 0.10,
     # Model-mined negatives (optional; CPU/GPU heavy)
     use_model_mined_negatives: bool = True,
     miner_model: str = 'contrastive',
@@ -362,6 +365,7 @@ def prepare_remote_gpu(
         num_hard_negative_books=num_hard_negative_books,
         n_positive_per_book=n_positive_per_book,
         n_negative_per_book=n_negative_per_book,
+        random_neg_frac=random_neg_frac,
         use_model_mined_negatives=use_model_mined_negatives,
         miner_model=miner_model,
         miner_model_dir=miner_model_dir,
@@ -5474,4 +5478,153 @@ def wipe_volumes(
         preserve_hf_cache=preserve_hf_cache,
         preserve_models=preserve_models,
         confirm=confirm,
+    )
+
+
+# -------------------------------
+# Word count utilities (Volumes)
+# -------------------------------
+
+@app.function(
+    image=image_data,
+    volumes={"/training": training_vol, "/vol": artifacts_vol},
+    timeout=60 * 60 * 2,
+)
+def count_words_remote(
+    roots: list[str] | None = None,
+    pattern: str = "*.txt",
+    verbose: bool = False,
+):
+    """Walk given roots and count words in matching text files.
+
+    - `roots`: directories to search recursively. Defaults to ['/training'].
+    - `pattern`: glob for files to include (default '*.txt').
+    - `verbose`: if True, prints per-file counts as it goes.
+    """
+    import re
+    from pathlib import Path
+
+    word_re = re.compile(r"\b\w+\b")
+    roots = roots or ["/training"]
+
+    total_words = 0
+    total_files = 0
+    per_root: dict[str, int] = {}
+
+    def count_file_words(p: Path) -> int:
+        cnt = 0
+        try:
+            with p.open("r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    cnt += len(word_re.findall(line))
+        except Exception:
+            return 0
+        return cnt
+
+    for root in roots:
+        root_path = Path(root)
+        root_total = 0
+        if not root_path.exists():
+            if verbose:
+                print(f"Skip missing root: {root}")
+            per_root[root] = 0
+            continue
+        for p in root_path.rglob(pattern):
+            if not p.is_file():
+                continue
+            n = count_file_words(p)
+            root_total += n
+            total_words += n
+            total_files += 1
+            if verbose:
+                print(f"{p}: {n}")
+        per_root[root] = root_total
+
+    print("Word count summary:")
+    for r, c in per_root.items():
+        print(f"  {r}: {c} words")
+    print(f"Total files: {total_files}")
+    print(f"TOTAL WORDS: {total_words}")
+    return {"total_words": total_words, "total_files": total_files, "per_root": per_root}
+
+
+@app.local_entrypoint()
+def count_words(
+    roots_csv: str = "/training",
+    pattern: str = "*.txt",
+    verbose: bool = False,
+):
+    """Local wrapper. Example:
+    - modal run modal_app.py::count_words --roots-csv /training/training/gutenberg
+    - modal run modal_app.py::count_words --roots-csv "/training,/vol"
+    """
+    roots = [x.strip() for x in roots_csv.split(",") if x.strip()]
+    return count_words_remote.remote(roots=roots, pattern=pattern, verbose=verbose)
+
+
+# -------------------------------
+# Diagnostics: count total chunks
+# -------------------------------
+
+@app.function(
+    image=image_cpu,
+    volumes={"/vol": artifacts_vol},
+    timeout=60 * 60,
+    env={"PYTHONPATH": "/workspace"},
+)
+def count_chunks_remote(
+    shards_dir: str = "/vol/tmp/prepare_shards",
+    manifest_path: str | None = None,
+):
+    """Return total books and chunks found across shard JSONLs.
+
+    - If a manifest JSON is provided, it should contain {"shards": [paths...]}
+    - Otherwise, globs shards_dir for files matching shard_*.jsonl
+    """
+    from pathlib import Path as _Path
+    import json as _json
+    from prepare_data import load_shards_jsonl
+
+    sdir = _Path(shards_dir)
+    shards: list[_Path] = []
+    manifest_files: list[str] = []
+    if manifest_path:
+        mp = _Path(manifest_path)
+        if mp.exists():
+            try:
+                data = _json.loads(mp.read_text(encoding="utf-8"))
+                manifest_files = [str(p) for p in data.get("shards", [])]
+                shards = [ _Path(p) for p in manifest_files if _Path(p).exists() ]
+            except Exception:
+                pass
+    if not shards:
+        shards = sorted(p for p in sdir.glob("shard_*.jsonl") if p.is_file())
+
+    if not shards:
+        result = {"books": 0, "chunks": 0, "shards": 0, "from_manifest": bool(manifest_files)}
+        print(result)
+        return result
+
+    book_chunks, _book_metadata = load_shards_jsonl(shards)
+    books = len(book_chunks)
+    chunks = sum(len(v) for v in book_chunks.values())
+    result = {"books": books, "chunks": chunks, "shards": len(shards), "from_manifest": bool(manifest_files)}
+    print(result)
+    return result
+
+
+@app.local_entrypoint()
+def count_chunks(
+    shards_dir: str = "/vol/tmp/prepare_shards",
+    manifest_path: str | None = None,
+):
+    """Local CLI entrypoint to return the total number of chunks.
+
+    Example:
+      modal run modal_app.py::count_chunks
+      modal run modal_app.py::count_chunks --shards-dir /vol/tmp/prepare_shards --manifest-path /vol/tmp/prepare_shards/shards_manifest.json
+    """
+    return count_chunks_remote.remote(
+        shards_dir=shards_dir,
+        manifest_path=manifest_path,
     )

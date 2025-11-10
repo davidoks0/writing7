@@ -250,6 +250,8 @@ def prepare_datasets(
     num_hard_negative_books: int = 50,
     n_positive_per_book: int = 20,
     n_negative_per_book: int = 40,
+    # Random negative fraction for regularization
+    random_neg_frac: float = 0.10,
     # Optional: model-mined negatives (expensive on CPU; use conservatively)
     use_model_mined_negatives: bool = True,
     miner_model: str = 'contrastive',  # 'contrastive' or 'cross'
@@ -528,37 +530,33 @@ def prepare_datasets(
             medium_books: List[str] = []
             hard_books: List[str] = []
             neg_types = ['random', 'author_same', 'metadata_similar', 'embed_neighbor']
-            if use_hard_negatives and book_id in book_metadata:
-                md = book_metadata[book_id]
-                medium_books = [
-                    bid for bid in book_set
-                    if bid != book_id and book_metadata.get(bid, {}).get('period') == md.get('period')
-                ]
+            # We no longer weight by metadata period; keep list for compatibility but weight=0.
             if use_embedding_hard_negatives and book_neighbors.get(book_id):
                 hard_books = [b for b in book_neighbors.get(book_id, []) if b in book_set and b != book_id]
 
-            # Sampling weights favoring medium/hard but preserving some easy
-            # Favor author_same when available, then embed, then metadata, with some random
-            weights = [
-                0.15,  # random
-                0.35 if author_books else 0.0,  # author_same
-                0.25 if medium_books else 0.0,  # metadata_similar
-                0.25 if hard_books else 0.0,    # embed_neighbor
-            ]
-            # Normalize
-            s = sum(weights)
-            if s <= 0:
-                weights = [1.0, 0.0, 0.0]
+            # Mix: random provides regularization; remaining mass split across available hard sources
+            rf = float(max(0.0, min(0.9, random_neg_frac)))
+            w_map = {k: 0.0 for k in neg_types}
+            if author_books and hard_books:
+                rem = 1.0 - rf
+                w_map['random'] = rf
+                w_map['author_same'] = rem / 2.0
+                w_map['embed_neighbor'] = rem / 2.0
+            elif author_books:
+                w_map['random'] = rf
+                w_map['author_same'] = 1.0 - rf
+            elif hard_books:
+                w_map['random'] = rf
+                w_map['embed_neighbor'] = 1.0 - rf
             else:
-                weights = [w / s for w in weights]
+                w_map['random'] = 1.0
+            weights = [w_map[t] for t in neg_types]
 
             # Create negative pairs
             for _ in range(n_negative_per_book):
                 choice = rng.choices(neg_types, weights=weights, k=1)[0]
                 if choice == 'embed_neighbor' and hard_books:
                     other_book_id = rng.choice(hard_books)
-                elif choice == 'metadata_similar' and medium_books:
-                    other_book_id = rng.choice(medium_books)
                 elif choice == 'author_same' and author_books:
                     other_book_id = rng.choice(author_books)
                 else:
@@ -1055,33 +1053,32 @@ def prepare_datasets_from_prechunked(
             medium_books: List[str] = []
             hard_books: List[str] = []
             neg_types = ['random', 'author_same', 'metadata_similar', 'embed_neighbor']
-            if use_hard_negatives and book_id in book_metadata:
-                md = book_metadata.get(book_id, {})
-                medium_books = [
-                    bid for bid in book_set
-                    if bid != book_id and book_metadata.get(bid, {}).get('period') == md.get('period')
-                ]
+            # We no longer weight by metadata period; keep list for compatibility but weight=0.
             if use_embedding_hard_negatives and (book_id in book_neighbors):
                 hard_books = [b for b in book_neighbors.get(book_id, []) if b in book_set and b != book_id]
 
-            weights = [
-                0.15,  # random
-                0.35 if author_books else 0.0,  # author_same
-                0.25 if medium_books else 0.0,  # metadata_similar
-                0.25 if hard_books else 0.0,    # embed_neighbor
-            ]
-            s = sum(weights)
-            if s <= 0:
-                weights = [1.0, 0.0, 0.0]
+            # Mix: random provides regularization; remaining mass split across available hard sources
+            rf = float(max(0.0, min(0.9, random_neg_frac)))
+            w_map = {k: 0.0 for k in neg_types}
+            if author_books and hard_books:
+                rem = 1.0 - rf
+                w_map['random'] = rf
+                w_map['author_same'] = rem / 2.0
+                w_map['embed_neighbor'] = rem / 2.0
+            elif author_books:
+                w_map['random'] = rf
+                w_map['author_same'] = 1.0 - rf
+            elif hard_books:
+                w_map['random'] = rf
+                w_map['embed_neighbor'] = 1.0 - rf
             else:
-                weights = [w / s for w in weights]
+                w_map['random'] = 1.0
+            weights = [w_map[t] for t in neg_types]
 
             for _ in range(n_negative_per_book):
                 choice = rng.choices(neg_types, weights=weights, k=1)[0]
                 if choice == 'embed_neighbor' and hard_books:
                     other_book_id = rng.choice(hard_books)
-                elif choice == 'metadata_similar' and medium_books:
-                    other_book_id = rng.choice(medium_books)
                 elif choice == 'author_same' and author_books:
                     other_book_id = rng.choice(author_books)
                 else:
