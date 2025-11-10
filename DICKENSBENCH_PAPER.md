@@ -20,11 +20,21 @@ To build our training set, we scraped the entire English-language corpus of the 
 
 After a robust preprocessing pipeline to handle the heterogeneous nature of text corpora and the presence of Gutenberg-related material – a pipeline that included unicode normalization to ensure consistent character representations, boilerplate removal, and whitespace standardization – we used a rule-based sentencizer from the spaCy natural language processing library to deconstruct each book into chunks of 14 sentences, with an overlap of four sentences and a minimum length of 200 characters. These parameters were selected to balance context sufficiency (14 sentences, typically coming out to between 350 and 500 tokens, was judged to be sufficient to capture local stylistic patterns like syntactic structure and lexical choice) with the 512-token limitation of the RoBERTa encoder while still providing dense within-book sampling. Finally, lightweight language filters removed non-English content, as well as remaining duplicate content (such as chapter headers or other boilerplate) that appear across at least three distinct books in the Gutenberg corpus. This process yielded several million chunks of text.
 
-Because the quality of contrastive training depends on the difficulty of negative examples, a hard negative mining procedure was implemented to identify "near miss" examples of superficially similar texts from different books. Up to 80 chunks per book were sampled and embedded through the use of a lightweight pretrained encoder (all-MiniLM-L6-v2), which computed book-level centroids by averaging these chunk embeddings:
+Because the quality of contrastive training depends on the difficulty of negative examples, a multi-tiered hard negative mining procedure was implemented to provide a spectrum of difficulty levels. The system uses four complementary strategies to select negative pairs (text chunks from different books):
+
+**Embedding-based hard negatives.** Up to 80 chunks per book were sampled and embedded through the use of a lightweight pretrained encoder (all-MiniLM-L6-v2), which computed book-level centroids by averaging these chunk embeddings:
 
 $$\mathbf{c}_b = \frac{1}{N_b}\sum_{i=1}^{N_b} \mathbf{e}_i$$
 
-where $\mathbf{c}_b$ is the centroid for book $b$, $N_b$ is the number of sampled chunks from book $b$, and $\mathbf{e}_i$ is the embedding of chunk $i$. A cross-book similarity search was performed to identify each book's top-50 nearest neighbor books in embedding space; finally, training pairs were constructed – 20 positive and 40 negative chunks per book, with sampling biased toward the identified nearest neighbors to ensure challenging negatives while retaining random negatives to prevent overfitting to the embedding topology.
+where $\mathbf{c}_b$ is the centroid for book $b$, $N_b$ is the number of sampled chunks from book $b$, and $\mathbf{e}_i$ is the embedding of chunk $i$. A cross-book similarity search was then performed to identify each book's top-50 nearest neighbor books in embedding space.
+
+**Same-author negatives.** To create particularly challenging negatives, the system identified pairs of different books written by the same author, forcing the model to distinguish between works that share authorial style. Anonymous and "unknown author" buckets were excluded to ensure consistent authorial style within each category.
+
+**Metadata-based negatives.** Books were matched by inferred temporal period (archaic, early modern, modern, contemporary) and genre (religious, historical, adventure, romance, general) using keyword-based heuristics, providing medium-difficulty negatives with shared stylistic conventions.
+
+**Random negatives.** A baseline set of random book pairs provided easy negative examples to anchor the difficulty spectrum.
+
+During training, negative pairs were sampled according to the following distribution: 35% same-author pairs (when available), 25% embedding-based neighbors, 25% metadata-similar books, and 15% random pairs. These weights were normalized dynamically when certain categories were unavailable for a given book. Training pairs were constructed with 20 positive pairs (same book) and 40 negative pairs (different books) per book, yielding a dataset of approximately 4.8M training pairs across ~58,000 books.
 
 ### 1.2.1 Model Architecture Details
 
