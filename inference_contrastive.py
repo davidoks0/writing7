@@ -7,13 +7,13 @@ import torch
 import numpy as np
 import re
 from transformers import AutoTokenizer
-from train_contrastive import ContrastiveBookMatcher, extract_style_features_batch
+from train_contrastive import ContrastiveBookMatcher
 
 
 class ContrastiveBookMatcherInference:
     """Class for making predictions with contrastive model."""
 
-    def __init__(self, model_path: str, threshold: float | None = None, calibration_path: str | None = None, style_calibration_path: str | None = None, device: str | None = None):
+    def __init__(self, model_path: str, threshold: float | None = None, calibration_path: str | None = None, style_calibration_path: str | None = None, device: str | None = None, verbose: bool = True):
         """Load model and tokenizer, auto-detecting base encoder size (base vs large).
 
         device: Optional override ('cpu', 'cuda', 'mps', or 'auto'/None for automatic detection)
@@ -58,7 +58,7 @@ class ContrastiveBookMatcherInference:
                 "  modal volume get writing7-artifacts /vol/models/book_matcher_contrastive/final ./models/book_matcher_contrastive/final"
             )
 
-        # Detect base encoder width and whether style/symmetric/projection/attn were used
+        # Detect base encoder width from checkpoint
         hidden_size = None
         try:
             emb = state_dict.get('encoder.embeddings.word_embeddings.weight')
@@ -79,46 +79,11 @@ class ContrastiveBookMatcherInference:
         except Exception:
             pass
 
-        # Detect style/symmetric features, classifier, and topic adversary by inspecting weights
-        use_style_features = False
-        use_symmetric_features = False
+        # Detect projection, topic adversary, and pooling by inspecting weights
         use_projection = False
         pooling = 'mean'
-        classifier_type = 'mlp'
         use_topic_adversary = False
         n_topics = 5
-
-        # First, detect classifier type
-        try:
-            if any(k.startswith('arcface.weight') for k in state_dict.keys()):
-                classifier_type = 'arcface'
-        except Exception:
-            pass
-
-        # Determine the input dim to the head to infer features
-        head_in_features = None
-        try:
-            if classifier_type == 'arcface':
-                w0 = state_dict.get('feat_head.0.weight')
-                if w0 is not None:
-                    head_in_features = int(w0.shape[1])
-            else:
-                w0 = state_dict.get('classifier.0.weight')
-                if w0 is not None:
-                    head_in_features = int(w0.shape[1])
-        except Exception:
-            head_in_features = None
-
-        # Infer use_symmetric_features and use_style_features from head input size
-        if hidden_size is not None and head_in_features is not None:
-            base = hidden_size * 2
-            residual = head_in_features - base
-            if residual >= (hidden_size * 2):
-                use_symmetric_features = True
-                residual -= hidden_size * 2
-            # We add 3 style features per side (total 6). If any residual remains, assume style features were used.
-            if residual > 0:
-                use_style_features = True
 
         # Projection head presence
         try:
@@ -129,17 +94,26 @@ class ContrastiveBookMatcherInference:
 
         # Topic head presence
         try:
-            if any(k.startswith('topic_head.0.weight') for k in state_dict.keys()):
+            topic_keys = [k for k in state_dict.keys() if k.startswith('topic_head.')]
+            if topic_keys:
                 use_topic_adversary = True
-                # Infer n_topics from last linear layer
+                # Try to infer the output dim from the last Linear layer weight in the Sequential
+                # Find all 'topic_head.<idx>.weight' and take the one with max idx
+                last_w = None
+                last_idx = -1
+                import re as _re
                 for k, v in state_dict.items():
-                    if k.startswith('topic_head.') and k.endswith('weight'):
-                        # Find the last Linear's weight by taking the max layer index
-                        pass
-                # More direct: try known key
-                w_last = state_dict.get('topic_head.3.weight') or state_dict.get('topic_head.2.weight')
-                if w_last is not None and hasattr(w_last, 'shape'):
-                    n_topics = int(w_last.shape[0])
+                    m = _re.match(r'^topic_head\.(\d+)\.weight$', k)
+                    if m:
+                        idx = int(m.group(1))
+                        if idx > last_idx:
+                            last_idx = idx
+                            last_w = v
+                if last_w is None:
+                    # Fallback to common positions
+                    last_w = state_dict.get('topic_head.3.weight') or state_dict.get('topic_head.2.weight')
+                if last_w is not None and hasattr(last_w, 'shape'):
+                    n_topics = int(last_w.shape[0])
         except Exception:
             pass
 
@@ -152,20 +126,37 @@ class ContrastiveBookMatcherInference:
         except Exception:
             pooling = 'mean'
 
-        # Initialize model architecture to match checkpoint
+        # Initialize model architecture to match checkpoint (contrastive-only)
         self.model = ContrastiveBookMatcher(
             model_name=detected_model_name,
-            use_style_features=use_style_features,
-            use_symmetric_features=use_symmetric_features,
             pooling=pooling,
             use_projection=use_projection,
-            classifier=classifier_type,
-             use_topic_adversary=use_topic_adversary,
-             n_topics=n_topics,
+            use_topic_adversary=use_topic_adversary,
+            n_topics=n_topics,
+            topic_out_dim=n_topics,
+            contrastive_only=True,
         )
+        self.contrastive_only = True
 
         # Now load weights
-        # Allow missing/unexpected keys for backwards/forwards compatibility (e.g., class_weights)
+        # Allow missing/unexpected keys for backwards/forwards compatibility.
+        # Additionally, drop adversary head weights if their shapes don't match (not used at inference).
+        try:
+            current = self.model.state_dict()
+            drop_keys = []
+            for k, t in state_dict.items():
+                if (k.startswith('topic_head.') or k.startswith('topic_head_pre.')) and k in current:
+                    try:
+                        if tuple(t.shape) != tuple(current[k].shape):
+                            drop_keys.append(k)
+                    except Exception:
+                        drop_keys.append(k)
+            for k in drop_keys:
+                state_dict.pop(k, None)
+                if verbose:
+                    print({"warning": f"dropped_mismatched_key: {k}"})
+        except Exception:
+            pass
         self.model.load_state_dict(state_dict, strict=False)
         self.model.to(self.device)
         self.model.eval()
@@ -186,11 +177,12 @@ class ContrastiveBookMatcherInference:
         except Exception:
             # Last resort: base model
             self.tokenizer = AutoTokenizer.from_pretrained(detected_model_name)
-        print(
-            f"Loaded model from {model_path} (base={detected_model_name}, style={use_style_features}, "
-            f"sym={use_symmetric_features}, proj={use_projection}, pooling={pooling}, cls={classifier_type}, "
-            f"topic_adv={use_topic_adversary}, n_topics={n_topics}) on {self.device}"
-        )
+        if verbose:
+            print(
+                f"Loaded contrastive-only model from {model_path} (base={detected_model_name}, "
+                f"proj={use_projection}, pooling={pooling}, "
+                f"topic_adv={use_topic_adversary}, n_topics={n_topics}) on {self.device}"
+            )
 
         # Calibration (temperature + threshold)
         self.temperature = 1.0
@@ -413,66 +405,33 @@ class ContrastiveBookMatcherInference:
     def predict(self, text1: str, text2: str) -> dict:
         """
         Predict whether two text chunks come from the same book.
-        
+
+        Uses cosine similarity between embeddings.
+
         Args:
             text1: First text chunk
             text2: Second text chunk
-        
+
         Returns:
-            dict with 'same_book' (bool), 'confidence' (float), and 'probability' (float)
+            dict with 'same_book' (bool), 'confidence' (float), 'probability' (float),
+            'cosine' (float), and 'method' ('embedding')
         """
-        # Tokenize
-        encoded1 = self.tokenizer(
-            text1,
-            truncation=True,
-            padding='max_length',
-            max_length=512,
-            return_tensors='pt'
-        )
-        
-        encoded2 = self.tokenizer(
-            text2,
-            truncation=True,
-            padding='max_length',
-            max_length=512,
-            return_tensors='pt'
-        )
-        
-        # Extract style features
-        style_features_1 = extract_style_features_batch([text1])
-        style_features_2 = extract_style_features_batch([text2])
-        
-        # Move to device
-        input_ids_1 = encoded1['input_ids'].to(self.device)
-        attention_mask_1 = encoded1['attention_mask'].to(self.device)
-        input_ids_2 = encoded2['input_ids'].to(self.device)
-        attention_mask_2 = encoded2['attention_mask'].to(self.device)
-        
-        style_features_1 = torch.tensor(style_features_1, dtype=torch.float32).to(self.device)
-        style_features_2 = torch.tensor(style_features_2, dtype=torch.float32).to(self.device)
-        
-        # Predict
-        with torch.no_grad():
-            outputs = self.model(
-                input_ids_1=input_ids_1,
-                attention_mask_1=attention_mask_1,
-                input_ids_2=input_ids_2,
-                attention_mask_2=attention_mask_2,
-                style_features_1=style_features_1,
-                style_features_2=style_features_2
-            )
-            logits = outputs['logits'] / self.temperature
-            probs = torch.softmax(logits, dim=1)
-        
-        # Get prediction
-        same_book_prob = probs[0][1].item()
-        same_book = same_book_prob >= self.threshold
-        confidence = same_book_prob if same_book else (1 - same_book_prob)
-        
+        # Get embeddings
+        emb1 = self._embed_texts([text1], max_length=512, use_projection=True)
+        emb2 = self._embed_texts([text2], max_length=512, use_projection=True)
+        # Compute cosine similarity (embeddings are already normalized)
+        cosine = float(np.dot(emb1[0], emb2[0]))
+        # Map cosine [-1, 1] to probability-like [0, 1]
+        # Using (cos + 1) / 2 as a simple mapping
+        prob = (cosine + 1.0) / 2.0
+        same_book = prob >= self.threshold
+        confidence = prob if same_book else (1 - prob)
         return {
             'same_book': same_book,
             'confidence': confidence,
-            'probability': same_book_prob
+            'probability': prob,
+            'cosine': cosine,
+            'method': 'embedding',
         }
     
     def predict_batch(self, pairs: list) -> list:

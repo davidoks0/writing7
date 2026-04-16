@@ -215,13 +215,43 @@ def _gen_gemini(model: str, prompt: str, *, system: Optional[str], max_tokens: i
             time.sleep(delay)
         try:
             resp = m.generate_content(contents, safety_settings=safety, generation_config=generation_config)
-            text = getattr(resp, "text", None)
-            if not text and hasattr(resp, "candidates") and resp.candidates:
-                try:
-                    text = resp.candidates[0].content.parts[0].text
-                except Exception:
-                    text = ""
-            return (text or "").strip()
+
+            # Avoid resp.text quick accessor since it can raise when no text Parts
+            # Extract any text from candidate content parts safely
+            text = ""
+            try:
+                candidates = getattr(resp, "candidates", None) or []
+                for cand in candidates:
+                    content = getattr(cand, "content", None)
+                    parts = getattr(content, "parts", None) or []
+                    chunks = []
+                    for p in parts:
+                        if hasattr(p, "text") and getattr(p, "text"):
+                            chunks.append(p.text)
+                    if chunks:
+                        text = "\n".join(chunks)
+                        break
+            except Exception:
+                # Fall through to error handling/retry below
+                text = ""
+
+            text = (text or "").strip()
+            if text:
+                return text
+
+            # No text returned; surface finish/block reasons to aid retries/diagnosis
+            try:
+                first = (getattr(resp, "candidates", None) or [None])[0]
+                finish_reason = getattr(first, "finish_reason", None)
+            except Exception:
+                finish_reason = None
+            try:
+                pf = getattr(resp, "prompt_feedback", None)
+                block_reason = getattr(pf, "block_reason", None)
+            except Exception:
+                block_reason = None
+            # Raise to trigger retry with a clearer message
+            raise RuntimeError(f"empty response (finish_reason={finish_reason}, block_reason={block_reason})")
         except Exception as e:
             # If the SDK rejects unknown fields (e.g., seed in GenerationConfig), retry without extras
             msg = str(e).lower()
@@ -255,8 +285,17 @@ def _gen_kimi(model: str, prompt: str, *, system: Optional[str], max_tokens: int
     client = OpenAI(api_key=api_key, base_url=base_url)
 
     use_responses = model.lower().startswith("kimi-k2") or ("k2" in model.lower() and not model.lower().startswith("moonshot-v1"))
+    # Optional: allow removing explicit token caps via env toggle
+    def _flag(name: str) -> bool:
+        v = os.getenv(name, "").strip().lower()
+        return v in {"1", "true", "yes", "on"}
+    uncapped = _flag("KIMI_NO_MAX_TOKENS")
     delays = [0.5, 1.5, 3.0]
     last_err: Exception | None = None
+
+    # Allow dynamic bumping of token limit up to 5000 if we hit length caps
+    token_cap = 5000
+    token_limit = int(max_tokens)
 
     if not use_responses:
         # Chat Completions path (moonshot-v1-*)
@@ -268,15 +307,31 @@ def _gen_kimi(model: str, prompt: str, *, system: Optional[str], max_tokens: int
             if delay:
                 time.sleep(delay)
             try:
-                resp = client.chat.completions.create(
+                cc_args = dict(
                     model=model,
                     messages=msgs,
                     temperature=temperature,
                     top_p=top_p,
-                    max_tokens=max_tokens,
                 )
-                content = resp.choices[0].message.content or ""
-                return content.strip()
+                if not uncapped:
+                    cc_args["max_tokens"] = token_limit
+                resp = client.chat.completions.create(**cc_args)
+                choice0 = resp.choices[0]
+                content = (getattr(choice0.message, "content", None) or "").strip()
+                # Inspect finish_reason to detect length truncation even if some content exists
+                try:
+                    finish_reason = getattr(choice0, "finish_reason", None)
+                except Exception:
+                    finish_reason = None
+                # Auto-bump on length caps up to token_cap
+                if (not uncapped) and str(finish_reason).lower() in {"length", "max_tokens", "max_output_tokens", "length_stop"} and token_limit < token_cap:
+                    token_limit = min(token_cap, int(max(token_limit * 2, token_limit + 512)))
+                    # retry immediately in next loop iteration
+                    raise RuntimeError(f"retry_with_higher_token_limit({token_limit})")
+                if content:
+                    return content
+                # If no content, surface finish_reason for diagnostics and retry
+                raise RuntimeError(f"empty response (finish_reason={finish_reason})")
             except Exception as e:
                 last_err = e
                 msg = str(e).lower()
@@ -299,13 +354,15 @@ def _gen_kimi(model: str, prompt: str, *, system: Optional[str], max_tokens: int
         if delay:
             time.sleep(delay)
         try:
-            resp = client.responses.create(
+            r_args = dict(
                 model=model,
                 input=input_payload,
                 temperature=temperature,
                 top_p=top_p,
-                max_output_tokens=max_tokens,
             )
+            if not uncapped:
+                r_args["max_output_tokens"] = token_limit
+            resp = client.responses.create(**r_args)
             # Prefer SDK convenience attr if present
             text = getattr(resp, "output_text", None)
             if not text:
@@ -323,31 +380,37 @@ def _gen_kimi(model: str, prompt: str, *, system: Optional[str], max_tokens: int
                     text = "\n".join(chunks)
                 except Exception:
                     text = None
-            return (text or "").strip()
+            text = (text or "").strip()
+            if text:
+                return text
+            # Check finish reason for truncation
+            try:
+                # Some implementations include a top-level status/finish_reason; best-effort extraction
+                finish_reason = getattr(resp, "finish_reason", None)
+                status = getattr(resp, "status", None)
+            except Exception:
+                finish_reason = None
+                status = None
+            # Auto-bump on length caps up to token_cap
+            if (not uncapped) and str(finish_reason).lower() in {"length", "max_tokens", "max_output_tokens", "length_stop"} and token_limit < token_cap:
+                token_limit = min(token_cap, int(max(token_limit * 2, token_limit + 512)))
+                # Continue to next attempt with higher limit
+                last_err = RuntimeError(f"retry_with_higher_token_limit({token_limit})")
+                continue
+            # No text, escalate so caller logs an error instead of printing blanks
+            raise RuntimeError(f"empty response (status={status}, finish_reason={finish_reason})")
         except Exception as e:
             last_err = e
             msg = str(e).lower()
             if "invalid api key" in msg or "invalid authentication" in msg:
                 break
-            # Some regions may not expose /responses; fall back to chat.completions
-            if "404" in msg or "url.not_found" in msg or "/v1/responses" in msg:
-                try:
-                    msgs = []
-                    if system:
-                        msgs.append({"role": "system", "content": system})
-                    msgs.append({"role": "user", "content": prompt})
-                    cc = client.chat.completions.create(
-                        model=model,
-                        messages=msgs,
-                        temperature=temperature,
-                        top_p=top_p,
-                        max_tokens=max_tokens,
-                    )
-                    content = cc.choices[0].message.content or ""
-                    return content.strip()
-                except Exception as e2:
-                    last_err = e2
-                    # Continue retry loop
-                    continue
+            # Some regions may not expose /responses; do not silently fall back to chat.
+            if "404" in msg or "url.not_found" in msg or "/v1/responses" in msg or "not found" in msg:
+                raise LLMError(
+                    "kimi error: K2 requires the Responses API, but /v1/responses is not available at "
+                    f"base_url={base_url}. Set KIMI_BASE_URL to the correct regional endpoint (e.g., "
+                    "https://api.moonshot.ai/v1 or https://api.moonshot.cn/v1), or switch to a chat model "
+                    "like 'moonshot-v1-8k'."
+                )
             continue
     raise LLMError(f"kimi error: {last_err}")

@@ -1,15 +1,14 @@
 """
-Evaluate a trained contrastive model on the test split using calibrated
-temperature + threshold. Prints both argmax (baseline) and calibrated metrics.
+Evaluate a trained contrastive model on the test split using cosine similarity.
+Prints metrics at various cosine thresholds.
 
 Usage:
   python evaluate_contrastive.py \
-    --model models/book_matcher_contrastive/final \
+    --model models/style_embedder/final \
     --data data/processed
 """
 from __future__ import annotations
 
-import os
 import json
 from typing import Optional
 
@@ -31,12 +30,11 @@ from inference_contrastive import ContrastiveBookMatcherInference
 
 
 @torch.no_grad()
-def collect_logits_labels(model, dataloader) -> tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+def collect_cosines_labels(model, dataloader) -> tuple[np.ndarray, np.ndarray]:
+    """Collect cosine similarities and labels from all batches."""
     device = next(model.parameters()).device
     model.eval()
-    logits_list, labels_list = [], []
-    tlog1_list, tlog2_list = [], []
-    tlab1_list, tlab2_list = [], []
+    cosines_list, labels_list = [], []
     for batch in dataloader:
         tbatch = {}
         for k, v in batch.items():
@@ -46,36 +44,26 @@ def collect_logits_labels(model, dataloader) -> tuple[np.ndarray, np.ndarray, Op
             attention_mask_1=tbatch['attention_mask_1'],
             input_ids_2=tbatch['input_ids_2'],
             attention_mask_2=tbatch['attention_mask_2'],
-            style_features_1=tbatch.get('style_features_1'),
-            style_features_2=tbatch.get('style_features_2'),
-            topic_labels_1=tbatch.get('topic_labels_1'),
-            topic_labels_2=tbatch.get('topic_labels_2'),
         )
-        logits_list.append(out['logits'].detach().cpu().numpy())
+        # Compute cosine similarity from embeddings
+        emb1 = torch.nn.functional.normalize(out['emb1_pooled'], p=2, dim=1)
+        emb2 = torch.nn.functional.normalize(out['emb2_pooled'], p=2, dim=1)
+        cos = (emb1 * emb2).sum(dim=1)
+        cosines_list.append(cos.detach().cpu().numpy())
         labels_list.append(tbatch['labels'].detach().cpu().numpy())
-        if out.get('topic_logits_1') is not None and out.get('topic_logits_2') is not None and tbatch.get('topic_labels_1') is not None:
-            tlog1_list.append(out['topic_logits_1'].detach().cpu().numpy())
-            tlog2_list.append(out['topic_logits_2'].detach().cpu().numpy())
-            tlab1_list.append(tbatch['topic_labels_1'].detach().cpu().numpy())
-            tlab2_list.append(tbatch['topic_labels_2'].detach().cpu().numpy())
-    logits = np.concatenate(logits_list, 0)
+    cosines = np.concatenate(cosines_list, 0)
     labels = np.concatenate(labels_list, 0)
-    tlog1 = np.concatenate(tlog1_list, 0) if tlog1_list else None
-    tlog2 = np.concatenate(tlog2_list, 0) if tlog2_list else None
-    tlab1 = np.concatenate(tlab1_list, 0) if tlab1_list else None
-    tlab2 = np.concatenate(tlab2_list, 0) if tlab2_list else None
-    return logits, labels, tlog1, tlog2, tlab1, tlab2
+    return cosines, labels
 
 
-def _metrics_from_preds(y_true, y_prob, y_pred):
+def _metrics_from_preds(y_true, y_score, y_pred):
     p, r, f1, _ = precision_recall_fscore_support(y_true, y_pred, average='binary', zero_division=0)
-    # Guard AUCs when only one class is present in y_true
     try:
-        auc = roc_auc_score(y_true, y_prob)
+        auc = roc_auc_score(y_true, y_score)
     except Exception:
         auc = float('nan')
     try:
-        pr_auc = average_precision_score(y_true, y_prob)
+        pr_auc = average_precision_score(y_true, y_score)
     except Exception:
         pr_auc = float('nan')
     return {
@@ -93,90 +81,51 @@ def _metrics_from_preds(y_true, y_prob, y_pred):
 def evaluate_contrastive(
     model_dir: str,
     data_dir: str = 'data/processed',
-    calibration_path: Optional[str] = None,
+    threshold: float = 0.5,
     max_length: int = 512,
 ):
-    # Load model + tokenizer via inference wrapper (auto-detects pooling/projection)
-    infer = ContrastiveBookMatcherInference(model_dir, calibration_path=calibration_path)
+    infer = ContrastiveBookMatcherInference(model_dir)
     tokenizer = infer.tokenizer
     model = infer.model
-    temperature = infer.temperature
-    threshold = infer.threshold
 
-    # Load dataset and tokenize test split
     datasets = load_from_disk(data_dir)
     if 'label' in datasets['test'].column_names:
         datasets = datasets.rename_column('label', 'labels')
-    tokenized = datasets['test'].map(lambda x: tokenize_pair(x, tokenizer, max_length=max_length), batched=True, remove_columns=[])
+    tokenized = datasets['test'].map(
+        lambda x: tokenize_pair(x, tokenizer, max_length=max_length),
+        batched=True, remove_columns=[],
+    )
     loader = DataLoader(tokenized, batch_size=32, shuffle=False, collate_fn=SiameseDataCollator())
 
-    # Collect logits and compute metrics
-    logits, labels, tlog1, tlog2, tlab1, tlab2 = collect_logits_labels(model, loader)
-    # Argmax baseline
-    argmax_pred = logits.argmax(axis=1)
-    prob = torch.softmax(torch.tensor(logits) / max(temperature, 1e-6), dim=1)[:, 1].numpy()
-    cal_pred = (prob >= threshold).astype(int)
+    cosines, labels = collect_cosines_labels(model, loader)
 
-    argmax_metrics = _metrics_from_preds(labels, prob, argmax_pred)
-    cal_metrics = _metrics_from_preds(labels, prob, cal_pred)
+    # Metrics at specified threshold
+    preds = (cosines >= threshold).astype(int)
+    metrics = _metrics_from_preds(labels, cosines, preds)
+
+    # Also sweep thresholds to find best F1
+    best_f1, best_thr = 0.0, threshold
+    for thr in np.linspace(0.0, 1.0, 101):
+        p = (cosines >= thr).astype(int)
+        _, _, f1, _ = precision_recall_fscore_support(labels, p, average='binary', zero_division=0)
+        if f1 > best_f1:
+            best_f1, best_thr = f1, thr
+
+    best_preds = (cosines >= best_thr).astype(int)
+    best_metrics = _metrics_from_preds(labels, cosines, best_preds)
 
     out = {
-        'temperature': float(temperature),
         'threshold': float(threshold),
-        'argmax': argmax_metrics,
-        'calibrated': cal_metrics,
+        'metrics_at_threshold': metrics,
+        'best_f1_threshold': float(best_thr),
+        'best_f1_metrics': best_metrics,
+        'cosine_stats': {
+            'mean': float(cosines.mean()),
+            'std': float(cosines.std()),
+            'pos_mean': float(cosines[labels == 1].mean()) if (labels == 1).any() else None,
+            'neg_mean': float(cosines[labels == 0].mean()) if (labels == 0).any() else None,
+        },
     }
-    # Optional: topic adversary evaluation (lower is better invariance)
-    try:
-        if tlog1 is not None and tlab1 is not None:
-            import numpy as np
-            tp1 = tlog1.argmax(axis=1)
-            tp2 = tlog2.argmax(axis=1)
-            tacc1 = float((tp1 == tlab1).mean())
-            tacc2 = float((tp2 == tlab2).mean())
-            out['topic_adversary'] = {
-                'acc_1': tacc1,
-                'acc_2': tacc2,
-                'mean_acc': float((tacc1 + tacc2) / 2.0),
-            }
-    except Exception:
-        pass
-    # Topic-sliced negative metrics (how often negatives are correctly rejected)
-    try:
-        if tlab1 is not None and tlab2 is not None:
-            import numpy as np
-            labels_np = np.asarray(labels)
-            same_topic = (np.asarray(tlab1) == np.asarray(tlab2))
-            neg_mask = (labels_np == 0)
-            # Build helper to compute negative accuracy
-            def _neg_acc(preds, mask):
-                if mask.sum() == 0:
-                    return float('nan')
-                return float((preds[mask] == 0).mean())
-
-            neg_same_argmax = _neg_acc(argmax_pred, neg_mask & same_topic)
-            neg_diff_argmax = _neg_acc(argmax_pred, neg_mask & (~same_topic))
-
-            neg_same_cal = _neg_acc(cal_pred, neg_mask & same_topic)
-            neg_diff_cal = _neg_acc(cal_pred, neg_mask & (~same_topic))
-
-            out['negatives_by_topic'] = {
-                'counts': {
-                    'negatives_total': int(neg_mask.sum()),
-                    'same_topic_negatives': int((neg_mask & same_topic).sum()),
-                    'diff_topic_negatives': int((neg_mask & (~same_topic)).sum()),
-                },
-                'argmax': {
-                    'same_topic_negative_accuracy': float(neg_same_argmax),
-                    'diff_topic_negative_accuracy': float(neg_diff_argmax),
-                },
-                'calibrated': {
-                    'same_topic_negative_accuracy': float(neg_same_cal),
-                    'diff_topic_negative_accuracy': float(neg_diff_cal),
-                }
-            }
-    except Exception:
-        pass
 
     print(json.dumps(out, indent=2))
     return out
@@ -184,10 +133,10 @@ def evaluate_contrastive(
 
 if __name__ == '__main__':
     import argparse
-    p = argparse.ArgumentParser(description='Evaluate contrastive model on test set using calibration.json')
-    p.add_argument('--model', type=str, required=True, help='Path to model final dir (…/final)')
+    p = argparse.ArgumentParser(description='Evaluate contrastive model on test set using cosine similarity')
+    p.add_argument('--model', type=str, required=True, help='Path to model final dir')
     p.add_argument('--data', type=str, default='data/processed', help='Path to processed datasets')
-    p.add_argument('--calibration', type=str, default=None, help='Optional path to calibration.json')
-    p.add_argument('--max-length', type=int, default=512, help='Tokenizer max_length for evaluation (default: 512)')
+    p.add_argument('--threshold', type=float, default=0.5, help='Cosine similarity threshold for classification')
+    p.add_argument('--max-length', type=int, default=512, help='Tokenizer max_length')
     args = p.parse_args()
-    evaluate_contrastive(args.model, data_dir=args.data, calibration_path=args.calibration, max_length=args.max_length)
+    evaluate_contrastive(args.model, data_dir=args.data, threshold=args.threshold, max_length=args.max_length)

@@ -172,8 +172,57 @@ def create_text_chunks(sentences: List[str], chunk_size: int = 20, overlap: int 
         if len(chunk.strip()) >= int(min_chars):  # Higher minimum chunk length by default
             if _is_likely_english(chunk):
                 chunks.append(chunk.strip())
-    
+
     return chunks
+
+
+def sample_non_overlapping_pair(chunks: List[str], chunk_size: int = 20, overlap: int = 5, rng: random.Random = None) -> Tuple[str, str]:
+    """Sample two chunks that don't share any sentences.
+
+    Given overlapping chunks, we need to ensure the selected pair doesn't share content.
+    Adjacent chunks share `overlap` sentences, so we need at least `ceil(overlap / step)`
+    chunks between selected indices to avoid overlap.
+
+    Args:
+        chunks: List of text chunks
+        chunk_size: Number of sentences per chunk
+        overlap: Number of overlapping sentences between adjacent chunks
+        rng: Random number generator
+
+    Returns:
+        Tuple of (chunk1, chunk2) that don't share sentences
+    """
+    if rng is None:
+        rng = random.Random()
+
+    if len(chunks) < 2:
+        raise ValueError("Need at least 2 chunks")
+
+    # Calculate minimum index gap to avoid overlap
+    # step = chunk_size - overlap (how far each chunk advances)
+    # Two chunks at indices i and j share content if |i - j| * step < chunk_size
+    # So we need |i - j| >= ceil(chunk_size / step) = ceil(chunk_size / (chunk_size - overlap))
+    step = max(1, chunk_size - overlap)
+    min_gap = max(1, (chunk_size + step - 1) // step)  # ceil division
+
+    # If we don't have enough chunks for non-overlap, fall back to maximizing distance
+    if len(chunks) <= min_gap:
+        # Just pick first and last
+        return chunks[0], chunks[-1]
+
+    # Sample first index, then sample second ensuring minimum gap
+    idx1 = rng.randrange(len(chunks))
+
+    # Valid indices for second chunk
+    valid_indices = [j for j in range(len(chunks)) if abs(j - idx1) >= min_gap]
+
+    if not valid_indices:
+        # Fallback: pick the furthest chunk
+        idx2 = 0 if idx1 >= len(chunks) // 2 else len(chunks) - 1
+    else:
+        idx2 = rng.choice(valid_indices)
+
+    return chunks[idx1], chunks[idx2]
 
 
 def _is_anonymous_author(author_slug: str) -> bool:
@@ -207,6 +256,7 @@ def prepare_datasets(
     val_ratio: float = 0.15,
     max_chunks_per_book: int = 800,
     use_hard_negatives: bool = True,
+    exclude_titles: Optional[List[str]] = None,
     # Embedding-based hard negatives
     use_embedding_hard_negatives: bool = True,
     embedding_model: str = 'sentence-transformers/all-MiniLM-L6-v2',
@@ -214,9 +264,11 @@ def prepare_datasets(
     num_hard_negative_books: int = 50,
     n_positive_per_book: int = 20,
     n_negative_per_book: int = 40,
+    # Fraction of easy random negatives to keep for regularization
+    random_neg_frac: float = 0.10,
     # Optional: model-mined negatives (expensive on CPU; use conservatively)
     use_model_mined_negatives: bool = True,
-    miner_model: str = 'contrastive',  # 'contrastive' or 'cross'
+    miner_model: str = 'contrastive',
     miner_model_dir: Optional[str] = None,
     n_mined_trials: int = 200,
     n_mined_keep: int = 20,
@@ -254,12 +306,23 @@ def prepare_datasets(
         use_hard_negatives: If True, sample negatives from similar books
         n_positive_per_book: Number of positive pairs per book
         n_negative_per_book: Number of negative pairs per book
+        random_neg_frac: Share of easy random negatives to include (0–0.9)
     
     Returns:
         DatasetDict with train/val/test splits
     """
     # Load all books (search recursively for .txt files)
+    def _norm_title(s: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", s.lower())
+    excl_norm: Set[str] = set()
+    if exclude_titles:
+        try:
+            excl_norm = {_norm_title(t) for t in exclude_titles if t and t.strip()}
+        except Exception:
+            excl_norm = set()
     book_files = list(training_dir.rglob('*.txt'))
+    if excl_norm:
+        book_files = [p for p in book_files if _norm_title(p.stem) not in excl_norm]
     print(f"Found {len(book_files)} books")
     
     # Process books into chunks (parallel by default)
@@ -346,36 +409,66 @@ def prepare_datasets(
             model = SentenceTransformer(embedding_model, device=device)
             model.max_seq_length = 256
             book_ids_all = list(book_chunks.keys())
-            # Cross-book batching on GPU
+            # Cross-book batching on GPU (supports single- and multi-GPU)
             if device == 'cuda':
                 micro = max(64, int(embed_microbatch))
                 bpp = max(256, int(embed_books_per_pass))
-                print(f"Encoding book centroids on GPU with microbatch={micro}, books_per_pass={bpp} ...")
+                n_gpus = int(torch.cuda.device_count())
+                use_multi = n_gpus > 1
+                if use_multi:
+                    targets = [f"cuda:{i}" for i in range(n_gpus)]
+                    print(f"Encoding book centroids on {n_gpus} GPUs with microbatch={micro}, books_per_pass={bpp} ...")
+                    pool = model.start_multi_process_pool(target_devices=targets)
+                else:
+                    print(f"Encoding book centroids on GPU with microbatch={micro}, books_per_pass={bpp} ...")
+                    pool = None
+
                 centroids: List[np.ndarray] = []
-                for start in range(0, len(book_ids_all), bpp):
-                    end = min(len(book_ids_all), start + bpp)
-                    ids_pass = book_ids_all[start:end]
-                    texts: List[str] = []
-                    counts: List[int] = []
-                    for bid in ids_pass:
-                        sample = book_chunks[bid][:num_chunks_for_embed]
-                        texts.extend(sample)
-                        counts.append(len(sample))
-                    if not texts:
-                        continue
-                    embs_pass = model.encode(texts, convert_to_numpy=True, batch_size=micro, normalize_embeddings=True)
-                    if embs_pass.dtype != np.float32:
-                        embs_pass = embs_pass.astype(np.float32)
-                    idx = 0
-                    for c in counts:
-                        if c <= 0:
-                            # Should not happen because books with no chunks are filtered earlier
-                            cent = np.zeros((embs_pass.shape[1],), dtype=np.float32)
+                try:
+                    for start in range(0, len(book_ids_all), bpp):
+                        end = min(len(book_ids_all), start + bpp)
+                        ids_pass = book_ids_all[start:end]
+                        texts: List[str] = []
+                        counts: List[int] = []
+                        for bid in ids_pass:
+                            sample = book_chunks[bid][:num_chunks_for_embed]
+                            texts.extend(sample)
+                            counts.append(len(sample))
+                        if not texts:
+                            continue
+                        if use_multi and pool is not None:
+                            embs_pass = model.encode_multi_process(
+                                texts,
+                                pool,
+                                batch_size=micro,
+                                normalize_embeddings=True,
+                                show_progress_bar=False,
+                            )
                         else:
-                            cent = np.mean(embs_pass[idx:idx + c], axis=0, dtype=np.float32)
-                        centroids.append(cent)
-                        idx += c
-                    print(f"  encoded {end}/{len(book_ids_all)} books...")
+                            embs_pass = model.encode(
+                                texts,
+                                convert_to_numpy=True,
+                                batch_size=micro,
+                                normalize_embeddings=True,
+                                show_progress_bar=False,
+                            )
+                        if embs_pass.dtype != np.float32:
+                            embs_pass = embs_pass.astype(np.float32)
+                        idx = 0
+                        for c in counts:
+                            if c <= 0:
+                                cent = np.zeros((embs_pass.shape[1],), dtype=np.float32)
+                            else:
+                                cent = np.mean(embs_pass[idx:idx + c], axis=0, dtype=np.float32)
+                            centroids.append(cent)
+                            idx += c
+                        print(f"  encoded {end}/{len(book_ids_all)} books...")
+                finally:
+                    if use_multi and pool is not None:
+                        try:
+                            model.stop_multi_process_pool(pool)
+                        except Exception:
+                            pass
                 book_embs = np.vstack(centroids).astype(np.float32, copy=False)
             else:
                 # CPU path: keep per-book encode with modest batch size
@@ -436,11 +529,17 @@ def prepare_datasets(
             best = 'general'
         return _TOPIC_VOCAB.index(best)
 
+    # Cache for heavy miners to avoid reloading per-book
+    _miner_cache: Dict[str, object] = {}
+
     # Create pairs for each split
     def create_pairs(book_set: set):
         """Create positive and negative pairs."""
         pairs = []
         rng = random.Random(42)
+        total_books = len(book_set)
+        done = 0
+        report_every = max(250, total_books // 20) if total_books else 1
         
         for book_id in book_set:
             chunks = book_chunks[book_id]
@@ -451,10 +550,16 @@ def prepare_datasets(
             if len(chunks) < 2:
                 continue
             
-            # Positive pairs (same book)
+            # Positive pairs (same book) - use non-overlapping chunks to prevent data leakage
             for _ in range(n_positive_per_book):
                 if len(chunks) >= 2:
-                    chunk1, chunk2 = random.sample(chunks, 2)
+                    try:
+                        chunk1, chunk2 = sample_non_overlapping_pair(
+                            chunks, chunk_size=chunk_size, overlap=overlap, rng=rng
+                        )
+                    except ValueError:
+                        # Fallback if not enough chunks
+                        chunk1, chunk2 = random.sample(chunks, 2)
                     t1 = _label_topic(chunk1)
                     t2 = _label_topic(chunk2)
                     pairs.append({
@@ -565,35 +670,32 @@ def prepare_datasets(
                         scored.append((c1, c2, ob))
 
                     if scored:
-                        # Score pairs with chosen miner
-                        probs = []
-                        if miner_model == 'contrastive':
-                            from inference_contrastive import ContrastiveBookMatcherInference
-                            # Prefer Modal volume path if present; fallback to local models dir
-                            def _pick_dir(default_local: str, default_vol: str) -> str:
-                                import os
-                                if miner_model_dir:
-                                    return miner_model_dir
-                                try:
-                                    if os.path.exists(os.path.join(default_vol, 'pytorch_model.bin')) or os.path.exists(os.path.join(default_vol, 'model.safetensors')):
-                                        return default_vol
-                                except Exception:
-                                    pass
-                                return default_local
-                            mdir = _pick_dir('models/book_matcher_contrastive/final', '/vol/models/book_matcher_contrastive/final')
-                            matcher = ContrastiveBookMatcherInference(mdir)
-                            for s1, s2, _ob in scored:
-                                res = matcher.predict(s1, s2)
-                                probs.append(res['probability'])
-                        else:
-                            from inference import BookMatcher
-                            mdir = miner_model_dir or ('/vol/models/book_matcher/final' if os.path.exists('/vol/models/book_matcher/final') else 'models/book_matcher/final')
-                            matcher = BookMatcher(mdir)
-                            for s1, s2, _ob in scored:
-                                res = matcher.predict(s1, s2)
-                                probs.append(res['probability'])
+                        # Score pairs with contrastive embedder (cosine similarity)
+                        from hard_negative_mining import ContrastiveChunkEmbedder
+                        def _pick_dir(default_local: str, default_vol: str) -> str:
+                            import os
+                            if miner_model_dir:
+                                return miner_model_dir
+                            try:
+                                if os.path.exists(os.path.join(default_vol, 'pytorch_model.bin')) or os.path.exists(os.path.join(default_vol, 'model.safetensors')):
+                                    return default_vol
+                            except Exception:
+                                pass
+                            return default_local
+                        mdir = _pick_dir('models/book_matcher_contrastive/final', '/vol/models/book_matcher_contrastive/final')
+                        embedder = _miner_cache.get('contrastive_embedder')  # type: ignore[assignment]
+                        if embedder is None:
+                            try:
+                                from transformers.utils import logging as _hf_logging
+                                _hf_logging.set_verbosity_error()
+                            except Exception:
+                                pass
+                            embedder = ContrastiveChunkEmbedder(mdir)
+                            _miner_cache['contrastive_embedder'] = embedder
+                        pairs_infer = [(s1, s2) for (s1, s2, _ob) in scored]
+                        probs = embedder.pair_probs(pairs_infer, batch_size=64)
 
-                        # Take top-k by probability (hardest negatives)
+                        # Take top-k by similarity (hardest negatives)
                         order = np.argsort(-np.array(probs))
                         k = min(n_mined_keep, len(order))
                         for idx in order[:k]:
@@ -614,6 +716,11 @@ def prepare_datasets(
                             })
                 except Exception as e:
                     print(f"Model-mined negatives skipped due to error: {e}")
+
+            # Per-book progress
+            done += 1
+            if done % report_every == 0:
+                print(f"Pairing progress: {done}/{total_books} books, pairs={len(pairs)}")
         
         # GPU-friendly ANN per-book miner restricted to neighbor books
         if use_ann_chunk_negatives and book_set and ann_miner_model_dir:
@@ -629,100 +736,212 @@ def prepare_datasets(
                     print(f"ANN embedder init failed: {e}")
                     embedder = None
                 if embedder is not None:
-                    device = embedder.device if hasattr(embedder, 'device') else torch.device('cpu')
-                    total_ann = 0
-                    for book_id in list(book_set):
+                    import math as _math
+                    import threading as _threading
+                    from contextlib import nullcontext as _nullcontext
+                    n_gpus = int(torch.cuda.device_count()) if torch.cuda.is_available() else 0
+                    ann_bs = max(8, int(ann_batch_size))
+
+                    # Cache pool embeddings per neighbor book to avoid re-embedding across targets
+                    pool_cache: Dict[str, Tuple[np.ndarray, List[str]]] = {}
+                    pool_lock = _threading.Lock()
+
+                    def _get_pool_cached(nb: str, emb: ContrastiveChunkEmbedder, per_nb: int) -> Tuple[np.ndarray, List[str]]:
                         try:
-                            anchors_src = book_chunks.get(book_id, [])
-                            if not anchors_src:
-                                continue
-                            # Sample anchors
-                            A = max(1, int(ann_anchors_per_book))
-                            if len(anchors_src) > A:
-                                idx = np.random.choice(len(anchors_src), size=A, replace=False)
-                                anchors = [anchors_src[i] for i in idx]
-                            else:
-                                anchors = list(anchors_src)
-                            # Gather pool from neighbor books (restricted)
-                            neigh_books = [b for b in (book_neighbors.get(book_id, []) or []) if b in book_set and b != book_id]
-                            if ann_k_neighbors > 0:
-                                neigh_books = neigh_books[: int(ann_k_neighbors)]
-                            pool_texts: List[str] = []
-                            pool_meta: List[str] = []  # neighbor book id per chunk
-                            per_nb = max(1, int(ann_pool_samples_per_book))
-                            for nb in neigh_books:
-                                chs = book_chunks.get(nb, [])
-                                if not chs:
-                                    continue
-                                if len(chs) > per_nb:
-                                    sel = np.random.choice(len(chs), size=per_nb, replace=False)
-                                    pts = [chs[i] for i in sel]
-                                else:
-                                    pts = list(chs)
-                                pool_texts.extend(pts)
-                                pool_meta.extend([nb] * len(pts))
-                            if not pool_texts:
-                                continue
-                            # Embed anchors and pool
-                            E_a = embedder.embed_texts(anchors, batch_size=max(8, int(ann_batch_size)))
-                            E_p = embedder.embed_texts(pool_texts, batch_size=max(8, int(ann_batch_size)))
-                            if E_a.size == 0 or E_p.size == 0:
-                                continue
-                            # Compute sims on GPU if available
-                            try:
-                                Ea = torch.from_numpy(E_a).to(device=device)
-                                Ep = torch.from_numpy(E_p).to(device=device)
-                                sims = Ea @ Ep.T
-                                sims_cpu = sims.detach().float().cpu().numpy()
-                                del sims
-                                if device.type == 'cuda':
-                                    torch.cuda.synchronize()
-                            except Exception:
-                                # CPU fallback
-                                sims_cpu = E_a @ E_p.T
-                            # Select candidates above threshold (top-1 per anchor)
-                            cand_pairs: List[Tuple[str, str, str]] = []  # (t1, t2, nb_book)
-                            for i in range(sims_cpu.shape[0]):
-                                row = sims_cpu[i]
-                                j = int(np.argmax(row))
-                                if float(row[j]) < float(ann_sim_threshold):
-                                    continue
-                                t1 = anchors[i]
-                                t2 = pool_texts[j]
-                                cand_pairs.append((t1, t2, pool_meta[j]))
-                            if not cand_pairs:
-                                continue
-                            # Rescore with model head and filter by prob_max
-                            pairs_infer = [(a, b) for (a, b, _nb) in cand_pairs]
-                            probs = embedder.pair_probs(pairs_infer, batch_size=max(8, int(ann_batch_size)))
-                            kept = 0
-                            for (t1, t2, nb), p in zip(cand_pairs, probs):
-                                if float(p) <= float(ann_prob_max):
-                                    t1t = _label_topic(t1)
-                                    t2t = _label_topic(t2)
-                                    pairs.append({
-                                        'text1': t1,
-                                        'text2': t2,
-                                        'label': 0,
-                                        'book1': book_id,
-                                        'book2': nb,
-                                        'pair_type': 'negative',
-                                        'neg_type': 'ann_mined',
-                                        'author1': (book_id.split('/',1)[0] if '/' in book_id else ''),
-                                        'author2': (nb.split('/',1)[0] if '/' in nb else ''),
-                                        'same_author': bool(('/' in book_id) and ('/' in nb) and (book_id.split('/',1)[0] == nb.split('/',1)[0])),
-                                        'topic1': int(t1t),
-                                        'topic2': int(t2t),
-                                        'same_topic': bool(t1t == t2t),
-                                    })
-                                    kept += 1
-                                    total_ann += 1
-                                    if kept >= int(ann_max_negatives_per_book):
-                                        break
-                            if ann_max_total_negatives is not None and total_ann >= int(ann_max_total_negatives):
-                                break
+                            with pool_lock:
+                                cached = pool_cache.get(nb)
+                            if cached is not None:
+                                return cached
                         except Exception:
-                            continue
+                            pass
+                        # Deterministic sampling per neighbor book
+                        chs = book_chunks.get(nb, [])
+                        if not chs:
+                            return np.zeros((0, 1), dtype=np.float32), []
+                        if len(chs) > per_nb:
+                            seed = (abs(hash(nb)) % (2**32))
+                            rng_local = np.random.default_rng(seed)
+                            idx = rng_local.choice(len(chs), size=per_nb, replace=False)
+                            pts = [chs[i] for i in idx]
+                        else:
+                            pts = list(chs)
+                        E = emb.embed_texts(pts, batch_size=ann_bs)
+                        try:
+                            with pool_lock:
+                                pool_cache[nb] = (E, pts)
+                        except Exception:
+                            pass
+                        return E, pts
+
+                    def _process_one(book_id: str, emb) -> List[Dict[str, object]]:
+                        out: List[Dict[str, object]] = []
+                        anchors_src = book_chunks.get(book_id, [])
+                        if not anchors_src:
+                            return out
+                        # Sample anchors
+                        A = max(1, int(ann_anchors_per_book))
+                        if len(anchors_src) > A:
+                            idx = np.random.choice(len(anchors_src), size=A, replace=False)
+                            anchors = [anchors_src[i] for i in idx]
+                        else:
+                            anchors = list(anchors_src)
+                        # Gather pool from neighbor books (restricted)
+                        neigh_books = [b for b in (book_neighbors.get(book_id, []) or []) if b in book_set and b != book_id]
+                        if ann_k_neighbors > 0:
+                            neigh_books = neigh_books[: int(ann_k_neighbors)]
+                        pool_texts: List[str] = []
+                        pool_meta: List[str] = []  # neighbor book id per chunk
+                        per_nb = max(1, int(ann_pool_samples_per_book))
+                        for nb in neigh_books:
+                            chs = book_chunks.get(nb, [])
+                            if not chs:
+                                continue
+                            if len(chs) > per_nb:
+                                sel = np.random.choice(len(chs), size=per_nb, replace=False)
+                                pts = [chs[i] for i in sel]
+                            else:
+                                pts = list(chs)
+                            pool_texts.extend(pts)
+                            pool_meta.extend([nb] * len(pts))
+                        if not pool_texts:
+                            return out
+                        # Embed anchors and pool (pool may be cached per neighbor book)
+                        E_a = emb.embed_texts(anchors, batch_size=ann_bs)
+                        # Assemble pool embeddings from cached per-neighbor chunks
+                        E_list: List[np.ndarray] = []
+                        pool_texts = []
+                        pool_meta = []
+                        for nb in neigh_books:
+                            E_nb, T_nb = _get_pool_cached(nb, emb, per_nb)
+                            if E_nb.size == 0:
+                                continue
+                            E_list.append(E_nb)
+                            pool_texts.extend(T_nb)
+                            pool_meta.extend([nb] * len(T_nb))
+                        E_p = np.vstack(E_list) if E_list else np.zeros((0, 1), dtype=np.float32)
+                        if E_a.size == 0 or E_p.size == 0:
+                            return out
+                        # Compute sims on device if available
+                        try:
+                            device = emb.device if hasattr(emb, 'device') else torch.device('cpu')
+                            Ea = torch.from_numpy(E_a).to(device=device)
+                            Ep = torch.from_numpy(E_p).to(device=device)
+                            # bf16 autocast for faster matmuls on CUDA
+                            _ctx = (
+                                torch.autocast(device_type='cuda', dtype=torch.bfloat16)  # type: ignore[attr-defined]
+                                if device.type == 'cuda' else _nullcontext()
+                            )
+                            with _ctx:
+                                sims = Ea @ Ep.T
+                            sims_cpu = sims.detach().float().cpu().numpy()
+                            del sims
+                            if device.type == 'cuda':
+                                torch.cuda.synchronize()
+                        except Exception:
+                            sims_cpu = E_a @ E_p.T
+                        # Select candidates above threshold (top-1 per anchor)
+                        cand_pairs: List[Tuple[str, str, str]] = []  # (t1, t2, nb_book)
+                        for i in range(sims_cpu.shape[0]):
+                            row = sims_cpu[i]
+                            j = int(np.argmax(row))
+                            if float(row[j]) < float(ann_sim_threshold):
+                                continue
+                            t1 = anchors[i]
+                            t2 = pool_texts[j]
+                            cand_pairs.append((t1, t2, pool_meta[j]))
+                        if not cand_pairs:
+                            return out
+                        # Rescore with model head and filter by prob_max
+                        pairs_infer = [(a, b) for (a, b, _nb) in cand_pairs]
+                        probs = emb.pair_probs(pairs_infer, batch_size=ann_bs)
+                        kept = 0
+                        for (t1, t2, nb), p in zip(cand_pairs, probs):
+                            if float(p) <= float(ann_prob_max):
+                                t1t = _label_topic(t1)
+                                t2t = _label_topic(t2)
+                                out.append({
+                                    'text1': t1,
+                                    'text2': t2,
+                                    'label': 0,
+                                    'book1': book_id,
+                                    'book2': nb,
+                                    'pair_type': 'negative',
+                                    'neg_type': 'ann_mined',
+                                    'author1': (book_id.split('/',1)[0] if '/' in book_id else ''),
+                                    'author2': (nb.split('/',1)[0] if '/' in nb else ''),
+                                    'same_author': bool(('/' in book_id) and ('/' in nb) and (book_id.split('/',1)[0] == nb.split('/',1)[0])),
+                                    'topic1': int(t1t),
+                                    'topic2': int(t2t),
+                                    'same_topic': bool(t1t == t2t),
+                                })
+                                kept += 1
+                                if kept >= int(ann_max_negatives_per_book):
+                                    break
+                        return out
+
+                    total_ann = 0
+                    books_list = list(book_set)
+                    if n_gpus <= 1:
+                        # Single device path with periodic progress
+                        progress_every = max(500, len(books_list) // 20)
+                        done = 0
+                        for bid in books_list:
+                            try:
+                                out_pairs = _process_one(bid, embedder)
+                                if out_pairs:
+                                    pairs.extend(out_pairs)
+                                    total_ann += len(out_pairs)
+                            except Exception:
+                                pass
+                            done += 1
+                            if done % progress_every == 0:
+                                print(f"ANN mining progress: {done}/{len(books_list)} books, ann_pairs={total_ann}")
+                    else:
+                        # Multi-GPU with thread workers, one embedder per device
+                        try:
+                            from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
+                        except Exception:
+                            ThreadPoolExecutor = None  # type: ignore
+                        embedders = {}
+                        for i in range(n_gpus):
+                            try:
+                                embedders[i] = ContrastiveChunkEmbedder(model_dir=ann_miner_model_dir, device=f"cuda:{i}")
+                            except Exception:
+                                embedders[i] = embedder  # fallback to default
+                        progress_every = max(500, len(books_list) // 20)
+                        done = 0
+                        if ThreadPoolExecutor is None:
+                            # Fallback to round-robin single-thread loop
+                            for idx, bid in enumerate(books_list):
+                                dev = idx % n_gpus
+                                try:
+                                    out_pairs = _process_one(bid, embedders.get(dev, embedder))
+                                    if out_pairs:
+                                        pairs.extend(out_pairs)
+                                        total_ann += len(out_pairs)
+                                except Exception:
+                                    pass
+                                done += 1
+                                if done % progress_every == 0:
+                                    print(f"ANN mining progress: {done}/{len(books_list)} books, ann_pairs={total_ann}")
+                        else:
+                            with ThreadPoolExecutor(max_workers=n_gpus) as ex:
+                                futs = []
+                                for idx, bid in enumerate(books_list):
+                                    dev = idx % n_gpus
+                                    emb_i = embedders.get(dev, embedder)
+                                    futs.append(ex.submit(_process_one, bid, emb_i))
+                                for fut in _as_completed(futs):
+                                    try:
+                                        out_pairs = fut.result()
+                                        if out_pairs:
+                                            pairs.extend(out_pairs)
+                                            total_ann += len(out_pairs)
+                                    except Exception:
+                                        pass
+                                    done += 1
+                                    if done % progress_every == 0:
+                                        print(f"ANN mining progress: {done}/{len(books_list)} books, ann_pairs={total_ann}")
                     if total_ann > 0:
                         print(f"ANN (GPU) mining added {total_ann} negatives.")
 
@@ -790,12 +1009,25 @@ def chunk_books_to_jsonl(
     max_chunks_per_book: int = 800,
     use_hard_negatives: bool = True,
     workers: Optional[int] = None,
+    exclude_titles: Optional[List[str]] = None,
 ) -> Dict[str, int]:
     """Process a subset of book files and write a JSONL shard with chunks and metadata.
 
     Returns a small dict of counts for diagnostics.
     """
+    def _norm_title(s: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", s.lower())
+
+    excl_norm: Set[str] = set()
+    if exclude_titles:
+        try:
+            excl_norm = {_norm_title(t) for t in exclude_titles if t and t.strip()}
+        except Exception:
+            excl_norm = set()
+
     files = [base_dir / p for p in rel_paths]
+    if excl_norm:
+        files = [p for p in files if _norm_title(p.stem) not in excl_norm]
     book_chunks: Dict[str, List[str]] = {}
     # no metadata collection for shards
 
@@ -874,6 +1106,7 @@ def prepare_datasets_from_prechunked(
     train_ratio: float = 0.7,
     val_ratio: float = 0.15,
     use_hard_negatives: bool = True,
+    exclude_titles: Optional[List[str]] = None,
     # Embedding-based hard negatives
     use_embedding_hard_negatives: bool = True,
     embedding_model: str = 'sentence-transformers/all-MiniLM-L6-v2',
@@ -883,7 +1116,7 @@ def prepare_datasets_from_prechunked(
     n_negative_per_book: int = 40,
     # Optional: model-mined negatives (expensive on CPU; use conservatively)
     use_model_mined_negatives: bool = True,
-    miner_model: str = 'contrastive',  # 'contrastive' or 'cross'
+    miner_model: str = 'contrastive',
     miner_model_dir: Optional[str] = None,
     n_mined_trials: int = 200,
     n_mined_keep: int = 20,
@@ -910,6 +1143,22 @@ def prepare_datasets_from_prechunked(
     Mirrors the latter half of prepare_datasets, including dedup, neighbors and pair creation.
     """
     book_metadata = book_metadata or {}
+
+    # Optionally drop excluded titles (match on normalized title component from book_id 'author/title')
+    if exclude_titles:
+        def _norm_title(s: str) -> str:
+            return re.sub(r"[^a-z0-9]", "", s.lower())
+        excl = {_norm_title(t) for t in exclude_titles if t and t.strip()}
+        if excl:
+            drop = []
+            for bid in list(book_chunks.keys()):
+                title = bid.split('/', 1)[1] if '/' in bid else bid
+                if _norm_title(title) in excl:
+                    drop.append(bid)
+            for bid in drop:
+                book_chunks.pop(bid, None)
+                if bid in book_metadata:
+                    book_metadata.pop(bid, None)
 
     # Simple cross-book deduplication by fingerprinting chunks
     if dedup_across_books and book_chunks:
@@ -1037,6 +1286,9 @@ def prepare_datasets_from_prechunked(
     def create_pairs(book_set: set):
         pairs = []
         rng = random.Random(42)
+        total_books = len(book_set)
+        done = 0
+        report_every = max(250, total_books // 20) if total_books else 1
 
         for book_id in book_set:
             chunks = book_chunks[book_id]
@@ -1150,31 +1402,30 @@ def prepare_datasets_from_prechunked(
 
                     if scored:
                         probs = []
-                        if miner_model == 'contrastive':
-                            from inference_contrastive import ContrastiveBookMatcherInference
-                            # Prefer Modal volume path if present; fallback to local models dir
-                            def _pick_dir(default_local: str, default_vol: str) -> str:
-                                import os
-                                if miner_model_dir:
-                                    return miner_model_dir
-                                try:
-                                    if os.path.exists(os.path.join(default_vol, 'pytorch_model.bin')) or os.path.exists(os.path.join(default_vol, 'model.safetensors')):
-                                        return default_vol
-                                except Exception:
-                                    pass
-                                return default_local
-                            mdir = _pick_dir('models/book_matcher_contrastive/final', '/vol/models/book_matcher_contrastive/final')
-                            matcher = ContrastiveBookMatcherInference(mdir)
-                            for s1, s2, _ob in scored:
-                                res = matcher.predict(s1, s2)
-                                probs.append(res['probability'])
-                        else:
-                            from inference import BookMatcher
-                            mdir = miner_model_dir or ('/vol/models/book_matcher/final' if os.path.exists('/vol/models/book_matcher/final') else 'models/book_matcher/final')
-                            matcher = BookMatcher(mdir)
-                            for s1, s2, _ob in scored:
-                                res = matcher.predict(s1, s2)
-                                probs.append(res['probability'])
+                        # Score pairs with contrastive embedder (cosine similarity)
+                        from hard_negative_mining import ContrastiveChunkEmbedder
+                        def _pick_dir(default_local: str, default_vol: str) -> str:
+                            import os
+                            if miner_model_dir:
+                                return miner_model_dir
+                            try:
+                                if os.path.exists(os.path.join(default_vol, 'pytorch_model.bin')) or os.path.exists(os.path.join(default_vol, 'model.safetensors')):
+                                    return default_vol
+                            except Exception:
+                                pass
+                            return default_local
+                        mdir = _pick_dir('models/book_matcher_contrastive/final', '/vol/models/book_matcher_contrastive/final')
+                        embedder = _miner_cache.get('contrastive_embedder')  # type: ignore[assignment]
+                        if embedder is None:
+                            try:
+                                from transformers.utils import logging as _hf_logging
+                                _hf_logging.set_verbosity_error()
+                            except Exception:
+                                pass
+                            embedder = ContrastiveChunkEmbedder(mdir)
+                            _miner_cache['contrastive_embedder'] = embedder
+                        pairs_infer = [(s1, s2) for (s1, s2, _ob) in scored]
+                        probs = embedder.pair_probs(pairs_infer, batch_size=64)
 
                         order = np.argsort(-np.array(probs))
                         k = min(n_mined_keep, len(order))
@@ -1196,6 +1447,10 @@ def prepare_datasets_from_prechunked(
                             })
                 except Exception as e:
                     print(f"Model-mined negatives skipped due to error: {e}")
+
+            done += 1
+            if done % report_every == 0:
+                print(f"Pairing progress: {done}/{total_books} books, pairs={len(pairs)}")
 
         # ANN experimental miner can be integrated here if desired (omitted to keep sharded path concise)
         return pairs

@@ -54,7 +54,7 @@ def _make_prompt(excerpt: str, topic: str, *, target_words: tuple[int, int] = (6
         f"STYLE REFERENCE\n---\n{excerpt}\n---\n\n"
         f"Write an original short story about: {topic}.\n"
         f"Match the reference's voice, rhythm, and paragraph structure.\n"
-        f"Avoid copying plot points, named entities, or distinctive phrases.\n"
+        f"Avoid copying plot points, named entities, or distinctive phrases. Avoid explicit violence, gore, and graphic harm. Keep content safe and non-graphic.\n"
         f"Target length: {lo}-{hi} words."
     )
 
@@ -249,6 +249,16 @@ def run_benchmark(
         })
 
     # Aggregate
+    # Validity: count samples that produced usable outputs (scores not marked as error)
+    total_n = len(samples)
+    valid_n = 0
+    for s in samples:
+        try:
+            if s.get("scores", {}).get("aggregate") != "error":
+                valid_n += 1
+        except Exception:
+            pass
+
     def _collect(key: str):
         vals = []
         for s in samples:
@@ -274,7 +284,9 @@ def run_benchmark(
         "median_cosine": (stats.median(cos) if cos else None),
         "median_score_0_1": (stats.median(s01) if s01 else None),
         "median_score_calibrated": (stats.median(scal) if scal else None),
-        "n": len(samples),
+        "n": total_n,
+        "valid": valid_n,
+        "valid_rate": (float(valid_n) / float(total_n) if total_n else None),
     }
 
     return {
@@ -297,3 +309,89 @@ def run_benchmark(
         "samples": samples,
         "aggregate": agg,
     }
+
+
+if __name__ == "__main__":
+    import argparse
+    import json as _json
+    ap = argparse.ArgumentParser(description="LLM style-match benchmark against a reference book excerpt")
+    # Core
+    ap.add_argument("--model", required=True, help="Provider-prefixed model, e.g. openai:gpt-4o-mini, anthropic:claude-3-5-sonnet, gemini:1.5-pro, kimi:moonshot-v1-8k")
+    ap.add_argument("--book_path", default="eval/books/gatsby.txt", help="Path to reference book .txt file")
+    ap.add_argument("--n_excerpts", type=int, default=5, help="How many independent excerpts to sample from the book")
+    ap.add_argument("--n_samples", type=int, default=1, help="How many generations per excerpt")
+    ap.add_argument("--seed", type=int, default=42, help="Global RNG seed for excerpt/topic selection")
+    ap.add_argument("--fixed_topic", type=str, default=None, help="Force all prompts to use this topic instead of random topics")
+    # Scorer (local contrastive matcher)
+    ap.add_argument("--model_dir", default="/vol/models/book_matcher_contrastive/final", help="Path to contrastive matcher directory containing weights (final/)")
+    ap.add_argument("--num_chunks", default="auto", help="Number of chunks per text or 'auto'")
+    ap.add_argument("--chunk_size", type=int, default=14, help="Sentences per chunk for style similarity")
+    ap.add_argument("--overlap", type=int, default=4, help="Sentence overlap between adjacent chunks")
+    ap.add_argument("--aggregate", choices=["mean", "topk_mean"], default="mean", help="Aggregation over pairwise chunk cosines")
+    ap.add_argument("--topk", type=int, default=5, help="Top-k for topk_mean aggregation")
+    ap.add_argument("--max_length", type=int, default=512, help="Max tokens per chunk for encoder")
+    # LLM sampling
+    ap.add_argument("--temperature", type=float, default=0.9)
+    ap.add_argument("--top_p", type=float, default=0.95)
+    ap.add_argument("--max_tokens", type=int, default=1200)
+    ap.add_argument("--concurrency", type=int, default=3, help="Parallel generation workers")
+    ap.add_argument("--stream_print", type=str, default="true", help="Print generations as they complete (true/false)")
+    ap.add_argument("--retry_empty", type=str, default="true", help="Retry empty/too-short outputs (true/false)")
+    ap.add_argument("--retry_attempts", type=int, default=2, help="Extra attempts when retrying")
+    ap.add_argument("--min_chars", type=int, default=50, help="Minimum characters required to accept a generation")
+    # Output
+    ap.add_argument("--out", type=str, default=None, help="Optional path to write full JSON results")
+
+    args = ap.parse_args()
+
+    def _to_bool(x: str) -> bool:
+        return str(x).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    # Parse num_chunks (int or 'auto')
+    try:
+        nc = int(args.num_chunks)
+    except Exception:
+        nc = "auto"
+
+    results = run_benchmark(
+        model=args.model,
+        book_path=args.book_path,
+        topics=None,
+        fixed_topic=args.fixed_topic,
+        n_samples=args.n_samples,
+        n_excerpts=args.n_excerpts,
+        seed=args.seed,
+        model_dir=args.model_dir,
+        num_chunks=nc,
+        chunk_size=args.chunk_size,
+        overlap=args.overlap,
+        aggregate=args.aggregate,
+        topk=args.topk,
+        max_length=args.max_length,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        max_tokens=args.max_tokens,
+        concurrency=args.concurrency,
+        stream_print=_to_bool(args.stream_print),
+        retry_empty=_to_bool(args.retry_empty),
+        retry_attempts=args.retry_attempts,
+        min_chars=args.min_chars,
+    )
+
+    agg = results.get("aggregate", {})
+    print("\n=== Aggregate ===")
+    try:
+        print(_json.dumps(agg, indent=2, sort_keys=True))
+    except Exception:
+        print(str(agg))
+    print("\nModel:", results.get("model"))
+    print("Book:", results.get("book"))
+    print("Excerpts:", results.get("n_excerpts"), "Samples/Excerpt:", results.get("n_samples_per_excerpt"))
+
+    if args.out:
+        try:
+            with open(args.out, "w", encoding="utf-8") as f:
+                _json.dump(results, f, ensure_ascii=False, indent=2)
+            print(f"\nWrote results to {args.out}")
+        except Exception as e:
+            print(f"[warn] failed to write --out file: {e}")

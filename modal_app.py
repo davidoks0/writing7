@@ -1,18 +1,13 @@
 """
-Modal setup for preparing data and training the classifier(s).
+Modal orchestration for the style similarity model.
 
-Provides:
-- prepare: generates datasets and stores them in a Modal Volume
-- train / train_gpu: baseline classifier training (CPU or GPU)
-- train_contrastive / train_contrastive_gpu: contrastive model training
-- pipeline: prepare then baseline train on CPU
+Provides cloud GPU/CPU entrypoints for data preparation, training,
+calibration, evaluation, inference, and visualization.
 
 Quick examples:
 - modal run modal_app.py::prepare -- --training-dir training
-- modal run modal_app.py::train -- --model roberta-base --epochs 3
-- modal run modal_app.py::train_gpu -- --model roberta-base --epochs 3
-- modal run modal_app.py::train_contrastive -- --model roberta-base
-- modal run modal_app.py::train_contrastive_gpu -- --model roberta-base
+- modal run modal_app.py::train_contrastive_gpu -- --model roberta-large
+- modal run modal_app.py::train_contrastive_remote_multi_gpu
 """
 import os
 from pathlib import Path
@@ -29,55 +24,73 @@ artifacts_vol = modal.Volume.from_name(ARTIFACT_VOL_NAME, create_if_missing=True
 training_vol = modal.Volume.from_name(TRAINING_VOL_NAME, create_if_missing=True)
 
 
-# Images
-image_cpu = (
-    modal.Image.debian_slim()
-    .apt_install("curl", "ca-certificates")
-    .add_local_file("requirements.txt", "/workspace/requirements.txt", copy=True)
-    .run_commands("curl -LsSf https://astral.sh/uv/install.sh | sh")
-    .run_commands("ln -sf /root/.local/bin/uv /usr/local/bin/uv")
-    .run_commands("uv pip install --system -r /workspace/requirements.txt")
-    .run_commands("python -m spacy download en_core_web_sm || true")
-    .add_local_dir("eval", "/workspace/eval")
-    .add_local_dir("scripts", "/workspace/scripts")
-    .add_local_file("standardize_training.py", "/workspace/standardize_training.py")
-    .add_local_file("train.py", "/workspace/train.py")
-    .add_local_file("train_contrastive.py", "/workspace/train_contrastive.py")
-    .add_local_file("calibrate_contrastive.py", "/workspace/calibrate_contrastive.py")
-    .add_local_file("evaluate_contrastive.py", "/workspace/evaluate_contrastive.py")
-    .add_local_file("prepare_data.py", "/workspace/prepare_data.py")
-    .add_local_file("inference.py", "/workspace/inference.py")
-    .add_local_file("inference_contrastive.py", "/workspace/inference_contrastive.py")
-    .add_local_file("inference_two_stage.py", "/workspace/inference_two_stage.py")
-    .add_local_file("calibrate_style_similarity.py", "/workspace/calibrate_style_similarity.py")
-    .add_local_file("style_map.py", "/workspace/style_map.py")
-)
+# --- Image helpers ---
+# All workspace source files, added once and reused across images.
+_WORKSPACE_FILES = [
+    "calibrate_style_similarity.py",
+    "evaluate_contrastive.py",
+    "hard_negative_mining.py",
+    "inference_contrastive.py",
+    "prepare_data.py",
+    "standardize_training.py",
+    "style_map.py",
+    "train_contrastive.py",
+]
 
-image_gpu = (
+def _add_workspace(img: modal.Image, *, include_scripts: bool = False) -> modal.Image:
+    """Add project source files and eval/ to a Modal image."""
+    for f in _WORKSPACE_FILES:
+        img = img.add_local_file(f, f"/workspace/{f}")
+    img = img.add_local_dir("eval", "/workspace/eval")
+    if include_scripts:
+        img = img.add_local_dir("scripts", "/workspace/scripts")
+    return img
+
+
+def _base_cpu() -> modal.Image:
+    return (
+        modal.Image.debian_slim()
+        .apt_install("curl", "ca-certificates")
+        .add_local_file("requirements.txt", "/workspace/requirements.txt", copy=True)
+        .run_commands("curl -LsSf https://astral.sh/uv/install.sh | sh")
+        .run_commands("ln -sf /root/.local/bin/uv /usr/local/bin/uv")
+        .run_commands("uv pip install --system -r /workspace/requirements.txt")
+        .run_commands("python -m spacy download en_core_web_sm || true")
+    )
+
+
+# --- Images ---
+image_cpu = _add_workspace(_base_cpu(), include_scripts=True)
+
+image_gpu = _add_workspace(
     modal.Image.debian_slim()
     .apt_install("curl", "ca-certificates")
     .add_local_file("requirements.txt", "/workspace/requirements.txt", copy=True)
-    # Install uv and CUDA-enabled torch first (avoids downloading CPU torch)
     .run_commands("curl -LsSf https://astral.sh/uv/install.sh | sh")
     .run_commands("ln -sf /root/.local/bin/uv /usr/local/bin/uv")
     .run_commands(
         "uv pip install --system --index-url https://download.pytorch.org/whl/cu121 torch==2.5.1+cu121"
     )
-    # Then the rest of requirements (keeps existing torch)
+    .run_commands("uv pip install --system --no-build-isolation flash-attn==2.5.8 || true")
     .run_commands("uv pip install --system -r /workspace/requirements.txt")
     .run_commands("python -m spacy download en_core_web_sm || true")
-    .add_local_dir("eval", "/workspace/eval")
-    .add_local_file("standardize_training.py", "/workspace/standardize_training.py")
-    .add_local_file("train.py", "/workspace/train.py")
-    .add_local_file("train_contrastive.py", "/workspace/train_contrastive.py")
-    .add_local_file("calibrate_contrastive.py", "/workspace/calibrate_contrastive.py")
-    .add_local_file("evaluate_contrastive.py", "/workspace/evaluate_contrastive.py")
-    .add_local_file("prepare_data.py", "/workspace/prepare_data.py")
-    .add_local_file("inference.py", "/workspace/inference.py")
-    .add_local_file("inference_contrastive.py", "/workspace/inference_contrastive.py")
-    .add_local_file("inference_two_stage.py", "/workspace/inference_two_stage.py")
-    .add_local_file("calibrate_style_similarity.py", "/workspace/calibrate_style_similarity.py")
-    .add_local_file("style_map.py", "/workspace/style_map.py")
+)
+
+# B200 (Blackwell sm_100) requires PyTorch 2.6+ with CUDA 12.8+
+image_gpu_b200 = _add_workspace(
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("curl", "ca-certificates")
+    .add_local_file("requirements.txt", "/workspace/requirements.txt", copy=True)
+    .run_commands("curl -LsSf https://astral.sh/uv/install.sh | sh")
+    .run_commands("ln -sf /root/.local/bin/uv /usr/local/bin/uv")
+    .run_commands("uv pip install --system packaging")
+    .run_commands(
+        "uv pip install --system --index-url https://download.pytorch.org/whl/cu128 torch==2.7.0+cu128"
+    )
+    .run_commands("uv pip install --system 'llvmlite>=0.41.0' 'numba>=0.58.0'")
+    .run_commands("uv pip install --system --no-build-isolation flash-attn || true")
+    .run_commands("uv pip install --system -r /workspace/requirements.txt")
+    .run_commands("python -m spacy download en_core_web_sm || true")
 )
 
 # Lightweight data image for I/O and mirroring tools
@@ -108,6 +121,7 @@ _GPU_H100_4 = _gpu_str("H100", 4)
 _GPU_H100_8 = _gpu_str("H100", 8)
 _GPU_A100_4 = _gpu_str("A100", 4)
 _GPU_A100_8 = _gpu_str("A100", 8)
+_GPU_B200_8 = _gpu_str("B200", 8)
 
 
 def _ensure_dirs():
@@ -124,6 +138,10 @@ COMMON_ENV = {
     "TOKENIZERS_PARALLELISM": "false",
     # Reduce CUDA fragmentation per PyTorch docs when VRAM is tight (PyTorch>=2.4)
     "PYTORCH_ALLOC_CONF": "expandable_segments:True",
+    # Stream logs immediately for better progress visibility
+    "PYTHONUNBUFFERED": "1",
+    # Conservative setting that often improves kernel scheduling on Hopper
+    "CUDA_DEVICE_MAX_CONNECTIONS": "1",
 }
 
 
@@ -150,6 +168,7 @@ def prepare_remote(
     num_hard_negative_books: int = 50,
     n_positive_per_book: int = 20,
     n_negative_per_book: int = 40,
+    exclude_titles: str | None = None,
     # Model-mined negatives (optional; CPU-heavy)
     use_model_mined_negatives: bool = True,
     miner_model: str = 'contrastive',
@@ -167,6 +186,8 @@ def prepare_remote(
     ann_batch_size: int = 32,
     ann_max_negatives_per_book: int = 100,
     ann_max_total_negatives: int | None = None,
+    # Fast mode tweaks
+    fast_mode: bool = True,
 ):
     import random
     import numpy as np
@@ -219,6 +240,27 @@ def prepare_remote(
     except Exception as e:
         print(f"Standardization step skipped due to error: {e}")
 
+    # Parse exclude list (comma or '|')
+    _excl_list = None
+    if exclude_titles:
+        try:
+            _excl_list = [t.strip() for t in re.split(r"[|,]", str(exclude_titles)) if t.strip()]
+        except Exception:
+            _excl_list = None
+
+    import re
+    # Optional fast-mode overrides (CPU-friendly; keep ANN off)
+    if bool(fast_mode):
+        try:
+            num_hard_negative_books = 15
+            n_positive_per_book = 10
+            n_negative_per_book = 20
+            num_chunks_for_embed = 24
+            max_chunks_per_book = min(max_chunks_per_book, 300)
+            use_model_mined_negatives = False
+            # ANN stays off on CPU path
+        except Exception:
+            pass
     datasets = prepare_datasets(
         training_dir=Path(training_dir),
         chunk_size=chunk_size,
@@ -227,6 +269,7 @@ def prepare_remote(
         val_ratio=val_ratio,
         max_chunks_per_book=max_chunks_per_book,
         use_hard_negatives=use_hard_negatives,
+        exclude_titles=_excl_list,
         use_embedding_hard_negatives=use_embedding_hard_negatives,
         embedding_model=embedding_model,
         num_chunks_for_embed=num_chunks_for_embed,
@@ -248,12 +291,101 @@ def prepare_remote(
         ann_batch_size=ann_batch_size,
         ann_max_negatives_per_book=ann_max_negatives_per_book,
         ann_max_total_negatives=ann_max_total_negatives,
+        random_neg_frac=0.30 if bool(fast_mode) else 0.10,
     )
 
     out_dir = "/vol/data/processed"
     datasets.save_to_disk(out_dir)
     print(f"Saved datasets to {out_dir}")
 
+
+@app.function(
+    image=image_cpu,
+    volumes={"/vol": artifacts_vol, "/input": training_vol},
+    secrets=[],
+    timeout=60 * 30,
+    cpu=2,
+    env={**COMMON_ENV, "PYTHONPATH": "/workspace"},
+)
+def purge_books_remote(
+    training_dir: str = "/input/training",
+    pattern: str = "",
+    dry_run: bool = True,
+    also_clean_dir: bool = True,
+):
+    """Find and optionally delete books whose path matches a pattern.
+
+    Args:
+      training_dir: Root folder with author/title .txt files.
+      pattern: Case-insensitive substring/regex. Separate multiple with '|' or ','.
+      dry_run: If True, only list matches. If False, delete them.
+      also_clean_dir: If True, also delete from /input/training_clean when present.
+    """
+    import os as _os
+    import re as _re
+    from pathlib import Path as _Path
+
+    base = _Path(training_dir)
+    if not base.exists():
+        print({"error": f"training_dir not found: {training_dir}"})
+        return {"ok": False, "deleted": 0, "matches": 0}
+
+    # Build regex from pattern tokens (split on '|' or ',')
+    pat = (pattern or "").strip()
+    if not pat:
+        print({"error": "pattern is empty; nothing to match"})
+        return {"ok": False, "deleted": 0, "matches": 0}
+    # Allow either a full regex or a list; if list, join with '|'
+    tokens = [t.strip() for t in _re.split(r"[|,]", pat) if t.strip()]
+    rx = _re.compile("|".join(_re.escape(t) for t in tokens), _re.IGNORECASE)
+
+    files = sorted(p for p in base.rglob('*.txt') if p.is_file())
+    matches = []
+    for p in files:
+        rel = str(p.relative_to(base))
+        if rx.search(rel):
+            matches.append((p, rel))
+
+    print({"training_dir": str(base), "total_txt": len(files), "matches": len(matches)})
+    for _, rel in matches[:200]:
+        print({"match": rel})
+    if len(matches) > 200:
+        print({"note": f"showing 200 of {len(matches)} matches"})
+
+    deleted = 0
+    if not dry_run and matches:
+        for p, rel in matches:
+            try:
+                p.unlink(missing_ok=True)  # py3.8+: use try/except for older
+                deleted += 1
+            except Exception as e:
+                print({"delete_error": rel, "error": str(e)})
+        # Optionally mirror deletions in training_clean
+        if also_clean_dir:
+            clean_root = _Path("/input/training_clean")
+            if clean_root.exists():
+                for _, rel in matches:
+                    cp = clean_root / rel
+                    try:
+                        if cp.exists():
+                            cp.unlink()
+                    except Exception as e:
+                        print({"delete_clean_error": rel, "error": str(e)})
+        # Best-effort: remove empty author dirs
+        try:
+            for sub in base.rglob('*'):
+                if sub.is_dir():
+                    try:
+                        next(sub.iterdir())
+                    except StopIteration:
+                        try:
+                            sub.rmdir()
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+    return {"ok": True, "matches": len(matches), "deleted": deleted, "dry_run": bool(dry_run)}
 
 # GPU-accelerated variant of prepare to speed up embedding-based negatives
 @app.function(
@@ -279,6 +411,7 @@ def prepare_remote_gpu(
     num_hard_negative_books: int = 50,
     n_positive_per_book: int = 20,
     n_negative_per_book: int = 40,
+    exclude_titles: str | None = None,
     # Model-mined negatives (optional; CPU/GPU heavy)
     use_model_mined_negatives: bool = True,
     miner_model: str = 'contrastive',
@@ -296,12 +429,19 @@ def prepare_remote_gpu(
     ann_batch_size: int = 64,
     ann_max_negatives_per_book: int = 40,
     ann_max_total_negatives: int | None = None,
+    # Fast mode tweaks
+    fast_mode: bool = True,
 ):
     import random
     import numpy as np
     import os
     from pathlib import Path as _Path
     from prepare_data import prepare_datasets
+    # Best-effort import to report GPU visibility
+    try:
+        import torch as _torch  # type: ignore
+    except Exception:
+        _torch = None
 
     _ensure_dirs()
 
@@ -348,6 +488,44 @@ def prepare_remote_gpu(
     except Exception as e:
         print(f"Standardization step skipped due to error: {e}")
 
+    # Parse exclude list
+    _excl_list = None
+    if exclude_titles:
+        try:
+            import re as _re
+            _excl_list = [t.strip() for t in _re.split(r"[|,]", str(exclude_titles)) if t.strip()]
+        except Exception:
+            _excl_list = None
+
+    # Optional fast-mode overrides (GPU-friendly)
+    if bool(fast_mode):
+        try:
+            num_hard_negative_books = 15
+            n_positive_per_book = 10
+            n_negative_per_book = 20
+            num_chunks_for_embed = 24
+            max_chunks_per_book = min(max_chunks_per_book, 300)
+            use_model_mined_negatives = False
+            use_ann_chunk_negatives = True
+            ann_k_neighbors = 15
+            ann_anchors_per_book = 16
+            ann_pool_samples_per_book = 8
+            ann_batch_size = max(ann_batch_size, 128)
+            ann_max_negatives_per_book = min(ann_max_negatives_per_book, 20)
+            ann_max_total_negatives = ann_max_total_negatives or 200_000
+        except Exception:
+            pass
+
+    print({
+        "phase": "prepare.begin",
+        "gpus_visible": (int(_torch.cuda.device_count()) if (_torch is not None and _torch.cuda.is_available()) else 0),
+        "use_ann": bool(use_ann_chunk_negatives),
+        "use_model_miner": bool(use_model_mined_negatives),
+        "embedding_model": str(embedding_model),
+        "num_chunks_for_embed": int(num_chunks_for_embed),
+        "max_chunks_per_book": int(max_chunks_per_book),
+    })
+
     datasets = prepare_datasets(
         training_dir=_Path(training_dir),
         chunk_size=chunk_size,
@@ -356,6 +534,7 @@ def prepare_remote_gpu(
         val_ratio=val_ratio,
         max_chunks_per_book=max_chunks_per_book,
         use_hard_negatives=use_hard_negatives,
+        exclude_titles=_excl_list,
         use_embedding_hard_negatives=use_embedding_hard_negatives,
         embedding_model=embedding_model,
         num_chunks_for_embed=num_chunks_for_embed,
@@ -377,11 +556,190 @@ def prepare_remote_gpu(
         ann_batch_size=ann_batch_size,
         ann_max_negatives_per_book=ann_max_negatives_per_book,
         ann_max_total_negatives=ann_max_total_negatives,
+        random_neg_frac=0.30 if bool(fast_mode) else 0.10,
     )
 
+    print({"phase": "prepare.save.begin"})
     out_dir = "/vol/data/processed"
     datasets.save_to_disk(out_dir)
-    print(f"Saved datasets to {out_dir}")
+    print({"phase": "prepare.done", "saved_to": out_dir})
+
+
+# 8x GPU variant for faster embedding/mining stages
+@app.function(
+    image=image_gpu,
+    volumes={"/vol": artifacts_vol, "/input": training_vol},
+    secrets=[],
+    gpu=_GPU_H200_8,
+    cpu=16,
+    timeout=60 * 60 * 12,
+    env={**COMMON_ENV, "PYTHONPATH": "/workspace"},
+)
+def prepare_remote_gpu_eight(
+    training_dir: str = "/input/training",
+    chunk_size: int = 14,
+    overlap: int = 4,
+    train_ratio: float = 0.7,
+    val_ratio: float = 0.15,
+    max_chunks_per_book: int = 800,
+    use_hard_negatives: bool = True,
+    use_embedding_hard_negatives: bool = True,
+    embedding_model: str = 'sentence-transformers/all-MiniLM-L6-v2',
+    num_chunks_for_embed: int = 80,
+    num_hard_negative_books: int = 50,
+    n_positive_per_book: int = 20,
+    n_negative_per_book: int = 40,
+    exclude_titles: str | None = None,
+    # Model-mined negatives (optional; CPU/GPU heavy)
+    use_model_mined_negatives: bool = True,
+    miner_model: str = 'contrastive',
+    miner_model_dir: str | None = None,
+    n_mined_trials: int = 200,
+    n_mined_keep: int = 20,
+    # ANN chunk-level hard negatives (GPU two-stage; default on for GPU)
+    use_ann_chunk_negatives: bool = True,
+    ann_miner_model_dir: str | None = "/vol/models/book_matcher_contrastive/final",
+    ann_k_neighbors: int = 20,
+    ann_sim_threshold: float = 0.55,
+    ann_prob_max: float = 0.20,
+    ann_anchors_per_book: int = 40,
+    ann_pool_samples_per_book: int = 20,
+    ann_batch_size: int = 64,
+    ann_max_negatives_per_book: int = 40,
+    ann_max_total_negatives: int | None = None,
+    # Fast mode tweaks
+    fast_mode: bool = True,
+):
+    import random
+    import numpy as np
+    import os
+    from pathlib import Path as _Path
+    from prepare_data import prepare_datasets
+    try:
+        import torch as _torch  # type: ignore
+    except Exception:
+        _torch = None
+
+    _ensure_dirs()
+
+    random.seed(42)
+    np.random.seed(42)
+
+    # Helpful diagnostics for empty directories
+    try:
+        print(f"Listing /input: {os.listdir('/input')}")
+    except Exception:
+        pass
+    try:
+        td = str(training_dir)
+        print(f"Listing {td}: {os.listdir(td) if os.path.exists(td) else 'MISSING'}")
+        num_txt = len(list(_Path(training_dir).rglob('*.txt')))
+        print(f"Found {num_txt} *.txt files under {training_dir} (recursive)")
+    except Exception:
+        pass
+
+    # Standardize raw texts into a cleaned mirror directory
+    try:
+        from standardize_training import clean_text as _clean_text
+        src_dir = _Path(training_dir)
+        dst_dir = _Path("/input/training_clean")
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        files = sorted(src_dir.rglob('*.txt'))
+        cleaned = 0
+        for src in files:
+            rel = src.relative_to(src_dir)
+            dst = dst_dir / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                raw = src.read_text(encoding='utf-8', errors='ignore')
+                txt = _clean_text(raw)
+                dst.write_text(txt, encoding='utf-8')
+                cleaned += 1
+            except Exception:
+                # On error, copy original
+                import shutil as _sh
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                _sh.copy2(src, dst)
+        print(f"Standardized {cleaned}/{len(files)} files -> {dst_dir}")
+        training_dir = str(dst_dir)
+    except Exception as e:
+        print(f"Standardization step skipped due to error: {e}")
+
+    # Parse exclude list
+    _excl_list = None
+    if exclude_titles:
+        try:
+            import re as _re
+            _excl_list = [t.strip() for t in _re.split(r"[|,]", str(exclude_titles)) if t.strip()]
+        except Exception:
+            _excl_list = None
+
+    # Optional fast-mode overrides (GPU-friendly)
+    if bool(fast_mode):
+        try:
+            num_hard_negative_books = 15
+            n_positive_per_book = 10
+            n_negative_per_book = 20
+            num_chunks_for_embed = 24
+            max_chunks_per_book = min(max_chunks_per_book, 300)
+            use_model_mined_negatives = False
+            use_ann_chunk_negatives = True
+            ann_k_neighbors = 15
+            ann_anchors_per_book = 16
+            ann_pool_samples_per_book = 8
+            ann_batch_size = max(ann_batch_size, 128)
+            ann_max_negatives_per_book = min(ann_max_negatives_per_book, 20)
+            ann_max_total_negatives = ann_max_total_negatives or 200_000
+        except Exception:
+            pass
+
+    print({
+        "phase": "prepare.begin",
+        "gpus_visible": (int(_torch.cuda.device_count()) if (_torch is not None and _torch.cuda.is_available()) else 0),
+        "use_ann": bool(use_ann_chunk_negatives),
+        "use_model_miner": bool(use_model_mined_negatives),
+        "embedding_model": str(embedding_model),
+        "num_chunks_for_embed": int(num_chunks_for_embed),
+        "max_chunks_per_book": int(max_chunks_per_book),
+    })
+
+    datasets = prepare_datasets(
+        training_dir=_Path(training_dir),
+        chunk_size=chunk_size,
+        overlap=overlap,
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+        max_chunks_per_book=max_chunks_per_book,
+        use_hard_negatives=use_hard_negatives,
+        exclude_titles=_excl_list,
+        use_embedding_hard_negatives=use_embedding_hard_negatives,
+        embedding_model=embedding_model,
+        num_chunks_for_embed=num_chunks_for_embed,
+        num_hard_negative_books=num_hard_negative_books,
+        n_positive_per_book=n_positive_per_book,
+        n_negative_per_book=n_negative_per_book,
+        use_model_mined_negatives=use_model_mined_negatives,
+        miner_model=miner_model,
+        miner_model_dir=miner_model_dir,
+        n_mined_trials=n_mined_trials,
+        n_mined_keep=n_mined_keep,
+        use_ann_chunk_negatives=use_ann_chunk_negatives,
+        ann_miner_model_dir=ann_miner_model_dir,
+        ann_k_neighbors=ann_k_neighbors,
+        ann_sim_threshold=ann_sim_threshold,
+        ann_prob_max=ann_prob_max,
+        ann_anchors_per_book=ann_anchors_per_book,
+        ann_pool_samples_per_book=ann_pool_samples_per_book,
+        ann_batch_size=ann_batch_size,
+        ann_max_negatives_per_book=ann_max_negatives_per_book,
+        ann_max_total_negatives=ann_max_total_negatives,
+        random_neg_frac=0.30 if bool(fast_mode) else 0.10,
+    )
+
+    print({"phase": "prepare.save.begin"})
+    out_dir = "/vol/data/processed"
+    datasets.save_to_disk(out_dir)
+    print({"phase": "prepare.done", "saved_to": out_dir})
 
 
 # --------------------- Sharded prepare across containers ---------------------
@@ -405,6 +763,7 @@ def prepare_chunk_shard_remote(
     max_chunks_per_book: int = 800,
     use_hard_negatives: bool = True,
     workers: int | None = 8,
+    exclude_titles: str | None = None,
 ):
     """Process a subset of books and write a shard JSONL to the volume."""
     from pathlib import Path as _Path
@@ -420,6 +779,15 @@ def prepare_chunk_shard_remote(
         "files": len(files),
         "out": str(out_path),
     })
+    # Parse exclude list
+    _excl_list = None
+    if exclude_titles:
+        try:
+            import re as _re
+            _excl_list = [t.strip() for t in _re.split(r"[|,]", str(exclude_titles)) if t.strip()]
+        except Exception:
+            _excl_list = None
+
     stats = chunk_books_to_jsonl(
         base_dir=bdir,
         rel_paths=[str(p) for p in files],
@@ -429,6 +797,7 @@ def prepare_chunk_shard_remote(
         max_chunks_per_book=int(max_chunks_per_book),
         use_hard_negatives=bool(use_hard_negatives),
         workers=(None if workers is None else int(workers)),
+        exclude_titles=_excl_list,
     )
     print({"shard": int(shard_index), **stats})
     return {"ok": True, **stats, "out": str(out_path)}
@@ -455,12 +824,15 @@ def prepare_merge_shards_remote_gpu(
     use_hard_negatives: bool = True,
     use_embedding_hard_negatives: bool = True,
     embedding_model: str = 'sentence-transformers/all-MiniLM-L6-v2',
-    num_chunks_for_embed: int = 80,
-    num_hard_negative_books: int = 50,
-    n_positive_per_book: int = 20,
-    n_negative_per_book: int = 40,
+    num_chunks_for_embed: int = 24,
+    num_hard_negative_books: int = 15,
+    n_positive_per_book: int = 10,
+    n_negative_per_book: int = 20,
     # Optional advanced miners off by default for merge step
     use_model_mined_negatives: bool = False,
+    exclude_titles: str | None = None,
+    # Fast mode tweaks
+    fast_mode: bool = True,
 ):
     """Wait for shard JSONLs, merge them, and finish dataset build on GPU."""
     import time as _time
@@ -523,12 +895,32 @@ def prepare_merge_shards_remote_gpu(
 
     book_chunks, book_metadata = load_shards_jsonl(shards)
     print({"books": len(book_chunks)})
+    # Parse exclude list
+    _excl_list = None
+    if exclude_titles:
+        try:
+            import re as _re
+            _excl_list = [t.strip() for t in _re.split(r"[|,]", str(exclude_titles)) if t.strip()]
+        except Exception:
+            _excl_list = None
+
+    # Fast-mode adjustments (only affects embedding/pair counts here)
+    if bool(fast_mode):
+        try:
+            num_hard_negative_books = 15
+            n_positive_per_book = 10
+            n_negative_per_book = 20
+            num_chunks_for_embed = 24
+        except Exception:
+            pass
+
     datasets = prepare_datasets_from_prechunked(
         book_chunks=book_chunks,
         book_metadata=book_metadata,
         train_ratio=train_ratio,
         val_ratio=val_ratio,
         use_hard_negatives=use_hard_negatives,
+        exclude_titles=_excl_list,
         use_embedding_hard_negatives=use_embedding_hard_negatives,
         embedding_model=embedding_model,
         num_chunks_for_embed=num_chunks_for_embed,
@@ -564,6 +956,7 @@ def prepare_sharded_remote(
     overlap: int = 4,
     max_chunks_per_book: int = 800,
     use_hard_negatives: bool = True,
+    exclude_titles: str | None = None,
     # Merge/build params
     train_ratio: float = 0.7,
     val_ratio: float = 0.15,
@@ -656,6 +1049,7 @@ def prepare_sharded_remote(
             max_chunks_per_book=max_chunks_per_book,
             use_hard_negatives=use_hard_negatives,
             workers=per_container_workers,
+            exclude_titles=exclude_titles,
         )
         calls.append(c)
 
@@ -716,6 +1110,7 @@ def prepare_sharded_remote(
         n_positive_per_book=n_positive_per_book,
         n_negative_per_book=n_negative_per_book,
         use_model_mined_negatives=False,
+        exclude_titles=exclude_titles,
     )
 
 
@@ -729,6 +1124,7 @@ def prepare_sharded(
     overlap: int = 4,
     max_chunks_per_book: int = 800,
     use_hard_negatives: bool = True,
+    exclude_titles: str | None = None,
     train_ratio: float = 0.7,
     val_ratio: float = 0.15,
     use_embedding_hard_negatives: bool = True,
@@ -746,6 +1142,7 @@ def prepare_sharded(
         overlap=overlap,
         max_chunks_per_book=max_chunks_per_book,
         use_hard_negatives=use_hard_negatives,
+        exclude_titles=exclude_titles,
         train_ratio=train_ratio,
         val_ratio=val_ratio,
         use_embedding_hard_negatives=use_embedding_hard_negatives,
@@ -755,77 +1152,6 @@ def prepare_sharded(
         n_positive_per_book=n_positive_per_book,
         n_negative_per_book=n_negative_per_book,
     )
-
-
-@app.function(
-    image=image_cpu,
-    volumes={"/vol": artifacts_vol, "/input": training_vol},
-    secrets=[],
-    timeout=60 * 60 * 12,
-    env={**COMMON_ENV, "PYTHONPATH": "/workspace"},
-)
-def train_remote(
-    model_name: str = "roberta-base",
-    num_epochs: int = 3,
-    batch_size: int = 16,
-    learning_rate: float = 2e-5,
-    warmup_steps: int = 500,
-    data_subdir: str = "/vol/data/processed",
-    output_subdir: str = "/vol/models/book_matcher",
-):
-    from train import train as train_fn
-
-    _ensure_dirs()
-
-    print("Starting training on Modal (CPU)...")
-    trainer, test_results = train_fn(
-        model_name=model_name,
-        output_dir=output_subdir,
-        data_dir=data_subdir,
-        num_epochs=num_epochs,
-        batch_size=batch_size,
-        learning_rate=learning_rate,
-        warmup_steps=warmup_steps,
-    )
-    print("Training complete.")
-    print({"test_results": test_results})
-
-
-@app.function(
-    image=image_gpu,
-    volumes={"/vol": artifacts_vol, "/input": training_vol},
-    secrets=[],
-    gpu=_GPU_H200_1,
-    cpu=8,
-    timeout=60 * 60 * 12,
-    env={**COMMON_ENV, "PYTHONPATH": "/workspace"},
-)
-def train_remote_gpu(
-    model_name: str = "roberta-base",
-    num_epochs: int = 3,
-    batch_size: int = 32,
-    learning_rate: float = 2e-5,
-    warmup_steps: int = 500,
-    data_subdir: str = "/vol/data/processed",
-    output_subdir: str = "/vol/models/book_matcher",
-    grad_checkpointing: bool = True,
-):
-    from train import train as train_fn
-
-    _ensure_dirs()
-
-    print("Starting training on Modal (GPU)...")
-    trainer, test_results = train_fn(
-        model_name=model_name,
-        output_dir=output_subdir,
-        data_dir=data_subdir,
-        num_epochs=num_epochs,
-        batch_size=batch_size,
-        learning_rate=learning_rate,
-        warmup_steps=warmup_steps,
-    )
-    print("GPU training complete.")
-    print({"test_results": test_results})
 
 
 @app.function(
@@ -870,7 +1196,7 @@ def train_contrastive_remote(
     tokenize_workers: int = 4,
     # Prep integration: run data prepare by default so users need no flags
     prepare_before_train: bool = True,
-    prepare_training_dir: str = "/input/training",
+    prepare_training_dir: str = "/input/training_clean/gutenberg",
     # Defaults aligned with pipeline_contrastive
     prep_chunk_size: int = 14,
     prep_overlap: int = 4,
@@ -987,7 +1313,7 @@ def train_contrastive_remote(
         arcface_margin=arcface_margin,
         arcface_scale=arcface_scale,
         contrastive_mode=contrastive_mode,
-        supcon_temperature=0.1,
+        supcon_temperature=supcon_temperature,
         max_length=max_length,
         grad_checkpointing=grad_checkpointing,
         teacher_on_gpu=teacher_on_gpu,
@@ -995,7 +1321,7 @@ def train_contrastive_remote(
         multi_head_adversary=True,
         use_independence_penalty=True,
         independence_weight=0.1,
-        adv_lambda=0.3,
+        adv_lambda=0.7,
         tokenize_workers=tokenize_workers,
     )
     print("Contrastive CPU training complete.")
@@ -1007,21 +1333,23 @@ def train_contrastive_remote(
     volumes={"/vol": artifacts_vol, "/input": training_vol},
     secrets=[],
     gpu=_GPU_H200_1,
-    timeout=60 * 60 * 12,
+    cpu=8,
+    timeout=60 * 60 * 24,  # 24 hours (Modal max)
     env={**COMMON_ENV, "PYTHONPATH": "/workspace"},
 )
 def train_contrastive_remote_gpu(
     model_name: str = "roberta-large",
     num_epochs: int = 6,
-    batch_size: int = 16,
-    learning_rate: float = 1e-5,
+    batch_size: int = 32,
+    learning_rate: float = 2e-5,
     warmup_steps: int = 1000,
-    use_style_features: bool = True,
-    use_symmetric_features: bool = True,
+    # Style/symmetric features disabled by default (not used in contrastive-only mode)
+    use_style_features: bool = False,
+    use_symmetric_features: bool = False,
     data_subdir: str = "/vol/data/processed",
-    output_subdir: str = "/vol/models/book_matcher_contrastive",
+    output_subdir: str = "/vol/models/style_embedder",
     contrastive_weight: float = 0.3,
-    # Distillation & calibration
+    # Distillation & calibration (not used in contrastive-only mode)
     distill_from_cross: bool = False,
     teacher_model_dir: str = "/vol/models/book_matcher/final",
     distill_weight: float = 0.5,
@@ -1032,14 +1360,15 @@ def train_contrastive_remote_gpu(
     pooling: str = "attn",
     use_projection: bool = True,
     label_smoothing: float = 0.03,
-    grad_accum_steps: int = 2,
+    grad_accum_steps: int = 1,
     select_metric: str = "auc",
     classifier: str = "arcface",
     arcface_margin: float = 0.25,
     arcface_scale: float = 30.0,
     contrastive_mode: str = "supcon",
+    supcon_temperature: float = 0.07,
     max_length: int = 384,
-    grad_checkpointing: bool = True,
+    grad_checkpointing: bool = False,
     teacher_on_gpu: bool = True,
     # Tokenization workers (None or <=0 uses all available cores)
     tokenize_workers: int | None = None,
@@ -1051,9 +1380,18 @@ def train_contrastive_remote_gpu(
     logging_steps: int = 100,
     eval_subset_size: int | None = None,
     disable_distillation: bool = True,
+    # Increase eval batch to reduce eval time (quality-neutral)
+    eval_batch_multiplier: int = 4,
+    # Contrastive-only mode - pure embedding learning, no classifier (DEFAULT)
+    contrastive_only: bool = True,
+    # Fine-tuning: initialize from a previous checkpoint
+    init_from: str | None = None,
+    # Topic adversary for style/content disentanglement (ON by default for proper style learning)
+    use_topic_adversary: bool = True,
+    adv_lambda: float = 0.7,
     # Prep integration: run data prepare by default so users need no flags
     prepare_before_train: bool = True,
-    prepare_training_dir: str = "/input/training",
+    prepare_training_dir: str = "/input/training_clean/gutenberg",
     # Defaults aligned with pipeline_contrastive
     prep_chunk_size: int = 14,
     prep_overlap: int = 4,
@@ -1144,6 +1482,23 @@ def train_contrastive_remote_gpu(
             )
 
     print("Starting contrastive training on Modal (GPU)...")
+    # Safety: ensure we don't accidentally trigger torch.distributed in single-GPU runs
+    try:
+        import os as _os
+        for _k in [
+            "LOCAL_RANK",
+            "RANK",
+            "WORLD_SIZE",
+            "MASTER_ADDR",
+            "MASTER_PORT",
+            "ACCELERATE_USE_DEEPSPEED",
+            "ACCELERATE_USE_FSDP",
+            "ACCELERATE_USE_DISTRIBUTED",
+        ]:
+            if _k in _os.environ:
+                _os.environ.pop(_k, None)
+    except Exception:
+        pass
     # Resolve tokenization worker count (use all vCPUs by default)
     try:
         import os as _os
@@ -1177,7 +1532,7 @@ def train_contrastive_remote_gpu(
         arcface_margin=arcface_margin,
         arcface_scale=arcface_scale,
         contrastive_mode=contrastive_mode,
-        supcon_temperature=0.1,
+        supcon_temperature=supcon_temperature,
         max_length=max_length,
         grad_checkpointing=grad_checkpointing,
         teacher_on_gpu=teacher_on_gpu,
@@ -1185,7 +1540,11 @@ def train_contrastive_remote_gpu(
         multi_head_adversary=True,
         use_independence_penalty=True,
         independence_weight=0.1,
-        adv_lambda=0.3,
+        # Topic adversary for style/content disentanglement
+        use_topic_adversary=use_topic_adversary,
+        adv_lambda=adv_lambda,
+        # Fine-tuning from checkpoint
+        init_from=init_from,
         tokenize_workers=_tok_workers,
         compile_model=True,
         eval_strategy=eval_strategy,
@@ -1194,10 +1553,358 @@ def train_contrastive_remote_gpu(
         save_steps=int(save_steps),
         logging_steps=int(logging_steps),
         eval_subset_size=eval_subset_size,
+        eval_batch_multiplier=int(eval_batch_multiplier),
         disable_distillation=bool(disable_distillation),
+        contrastive_only=bool(contrastive_only),
     )
     print("Contrastive GPU training complete.")
     print({"test_results": test_results})
+
+
+# --------------------- Cost-effective 4x H100 training ----------------------
+# Best value: ~42% cheaper than 8x H200, should fit in single 24h window
+# Includes retry as safety net in case it runs longer
+_H100_RETRIES = modal.Retries(initial_delay=0.0, max_retries=3)
+
+@app.function(
+    image=image_gpu,
+    volumes={"/vol": artifacts_vol, "/input": training_vol},
+    secrets=[],
+    gpu=_GPU_H100_4,  # 4x H100 - best cost/performance ratio
+    cpu=8,
+    timeout=60 * 60 * 24,  # 24 hours per attempt
+    retries=_H100_RETRIES,  # Auto-retry up to 3 times (96h max) as safety net
+    env={**COMMON_ENV, "PYTHONPATH": "/workspace"},
+)
+def train_contrastive_4x_h100(
+    # Core training params
+    model_name: str = "roberta-large",
+    num_epochs: int = 6,
+    batch_size: int = 24,  # H100 has 80GB, can use larger batch
+    learning_rate: float = 2e-5,
+    warmup_steps: int = 1000,
+    data_subdir: str = "/vol/data/processed",
+    output_subdir: str = "/vol/models/style_embedder",
+    contrastive_weight: float = 0.3,
+    pooling: str = "attn",
+    use_projection: bool = True,
+    label_smoothing: float = 0.03,
+    grad_accum_steps: int = 2,  # Effective batch = 24 * 4 * 2 = 192
+    select_metric: str = "auc",
+    contrastive_mode: str = "supcon",
+    supcon_temperature: float = 0.07,
+    max_length: int = 384,
+    grad_checkpointing: bool = False,  # H100 has enough memory
+    eval_strategy: str = 'epoch',
+    save_strategy: str = 'epoch',
+    logging_steps: int = 100,
+    eval_batch_multiplier: int = 4,
+    contrastive_only: bool = True,
+    use_topic_adversary: bool = True,
+    adv_lambda: float = 0.7,
+    # Data prep
+    prepare_before_train: bool = True,
+    prepare_training_dir: str = "/input/training_clean/gutenberg",
+    prep_chunk_size: int = 14,
+    prep_overlap: int = 4,
+    prep_train_ratio: float = 0.7,
+    prep_val_ratio: float = 0.15,
+    prep_max_chunks_per_book: int = 800,
+    prep_use_hard_negatives: bool = True,
+    prep_use_embedding_hard_negatives: bool = True,
+    prep_embedding_model: str = 'sentence-transformers/all-MiniLM-L6-v2',
+    prep_num_chunks_for_embed: int = 80,
+    prep_num_hard_negative_books: int = 50,
+    prep_n_positive_per_book: int = 20,
+    prep_n_negative_per_book: int = 40,
+):
+    """Cost-effective training on 4x H100 GPUs.
+
+    Best value option:
+    - ~42% cheaper than 8x H200 (~$316 vs ~$545)
+    - Completes in ~20 hours (fits in single 24h window)
+    - Auto-retry as safety net if it runs longer
+
+    Usage:
+        modal run modal_app.py::train_contrastive_4x_h100
+    """
+    import subprocess
+    import os as _os
+
+    _ensure_dirs()
+
+    # Data preparation (skip if already exists)
+    if prepare_before_train:
+        _ds_ready = _os.path.exists(_os.path.join(data_subdir, 'train')) and _os.path.exists(_os.path.join(data_subdir, 'validation'))
+        if not _ds_ready:
+            print("=== Running data preparation ===")
+            # Check if we have a prior model for ANN mining
+            ann_dir = "/vol/models/book_matcher_contrastive/final"
+            ann_ok = _os.path.exists(f"{ann_dir}/pytorch_model.bin") or _os.path.exists(f"{ann_dir}/model.safetensors")
+            try:
+                prepare_remote_gpu.remote(
+                    training_dir=prepare_training_dir,
+                    chunk_size=prep_chunk_size,
+                    overlap=prep_overlap,
+                    train_ratio=prep_train_ratio,
+                    val_ratio=prep_val_ratio,
+                    max_chunks_per_book=prep_max_chunks_per_book,
+                    use_hard_negatives=prep_use_hard_negatives,
+                    use_embedding_hard_negatives=prep_use_embedding_hard_negatives,
+                    embedding_model=prep_embedding_model,
+                    num_chunks_for_embed=prep_num_chunks_for_embed,
+                    num_hard_negative_books=prep_num_hard_negative_books,
+                    n_positive_per_book=prep_n_positive_per_book,
+                    n_negative_per_book=prep_n_negative_per_book,
+                    use_model_mined_negatives=ann_ok,
+                    use_ann_chunk_negatives=ann_ok,
+                    ann_miner_model_dir=(ann_dir if ann_ok else None),
+                    miner_model_dir=(ann_dir if ann_ok else None),
+                )
+            except Exception as e:
+                print(f"Warning: prepare_remote_gpu failed with miners, retrying without: {e}")
+                prepare_remote_gpu.remote(
+                    training_dir=prepare_training_dir,
+                    chunk_size=prep_chunk_size,
+                    overlap=prep_overlap,
+                    train_ratio=prep_train_ratio,
+                    val_ratio=prep_val_ratio,
+                    max_chunks_per_book=prep_max_chunks_per_book,
+                    use_hard_negatives=prep_use_hard_negatives,
+                    use_embedding_hard_negatives=prep_use_embedding_hard_negatives,
+                    embedding_model=prep_embedding_model,
+                    num_chunks_for_embed=prep_num_chunks_for_embed,
+                    num_hard_negative_books=prep_num_hard_negative_books,
+                    n_positive_per_book=prep_n_positive_per_book,
+                    n_negative_per_book=prep_n_negative_per_book,
+                    use_model_mined_negatives=False,
+                    use_ann_chunk_negatives=False,
+                )
+            print("Data preparation complete.")
+        else:
+            print("Dataset already exists, skipping preparation.")
+
+    # Build training command
+    cmd = [
+        "torchrun",
+        "--nproc_per_node", "4",
+        "--master_port", "29500",
+        "/workspace/train_contrastive.py",
+        "--data-dir", data_subdir,
+        "--output-dir", output_subdir,
+        "--model", model_name,
+        "--epochs", str(num_epochs),
+        "--batch-size", str(batch_size),
+        "--lr", str(learning_rate),
+        "--warmup-steps", str(warmup_steps),
+        "--grad-accum", str(grad_accum_steps),
+        "--max-length", str(max_length),
+        "--pooling", pooling,
+        "--contrastive-mode", contrastive_mode,
+        "--supcon-temperature", str(supcon_temperature),
+        "--label-smoothing", str(label_smoothing),
+        "--select-metric", select_metric,
+        "--eval-strategy", eval_strategy,
+        "--save-strategy", save_strategy,
+        "--logging-steps", str(logging_steps),
+        "--eval-batch-multiplier", str(eval_batch_multiplier),
+        "--contrastive-weight", str(contrastive_weight),
+        "--adv-lambda", str(adv_lambda),
+        "--resume",  # Auto-resume from checkpoint if retrying after timeout
+    ]
+    if not use_projection:
+        cmd.append("--no-projection")
+    if contrastive_only:
+        cmd.append("--contrastive-only")
+    if not use_topic_adversary:
+        cmd.append("--no-topic-adversary")
+    if grad_checkpointing:
+        cmd.append("--grad-ckpt")
+
+    print(f"Running: {' '.join(cmd)}")
+    result = subprocess.run(cmd, cwd="/workspace")
+
+    artifacts_vol.commit()
+
+    if result.returncode != 0:
+        raise RuntimeError(f"Training failed with return code {result.returncode}")
+
+    print("4x H100 training complete.")
+
+
+# --------------------- Budget training with auto-retry for long runs ----------------------
+# Uses 4x A100 (cheaper than H200) with checkpoint resumption for runs > 24h
+_BUDGET_RETRIES = modal.Retries(initial_delay=0.0, max_retries=5)
+
+@app.function(
+    image=image_gpu,
+    volumes={"/vol": artifacts_vol, "/input": training_vol},
+    secrets=[],
+    gpu=_GPU_A100_4,  # 4x A100 - good balance of cost and speed
+    cpu=8,
+    timeout=60 * 60 * 24,  # 24 hours per attempt
+    retries=_BUDGET_RETRIES,  # Auto-retry up to 5 times (6 total attempts = 144h max)
+    env={**COMMON_ENV, "PYTHONPATH": "/workspace"},
+)
+def train_contrastive_budget(
+    # Core training params
+    model_name: str = "roberta-large",
+    num_epochs: int = 6,
+    batch_size: int = 16,  # Smaller batch, compensated by grad_accum
+    learning_rate: float = 2e-5,
+    warmup_steps: int = 1000,
+    data_subdir: str = "/vol/data/processed",
+    output_subdir: str = "/vol/models/style_embedder",
+    contrastive_weight: float = 0.3,
+    pooling: str = "attn",
+    use_projection: bool = True,
+    label_smoothing: float = 0.03,
+    grad_accum_steps: int = 4,  # Higher accumulation to compensate for smaller batch
+    select_metric: str = "auc",
+    contrastive_mode: str = "supcon",
+    supcon_temperature: float = 0.07,
+    max_length: int = 384,
+    grad_checkpointing: bool = True,  # Save memory on A100s
+    eval_strategy: str = 'epoch',
+    save_strategy: str = 'epoch',  # Critical: save checkpoints for resumption
+    logging_steps: int = 100,
+    eval_batch_multiplier: int = 4,
+    contrastive_only: bool = True,
+    use_topic_adversary: bool = True,
+    adv_lambda: float = 0.7,
+    # Data prep
+    prepare_before_train: bool = True,
+    prepare_training_dir: str = "/input/training_clean/gutenberg",
+    prep_chunk_size: int = 14,
+    prep_overlap: int = 4,
+    prep_train_ratio: float = 0.7,
+    prep_val_ratio: float = 0.15,
+    prep_max_chunks_per_book: int = 800,
+    prep_use_hard_negatives: bool = True,
+    prep_use_embedding_hard_negatives: bool = True,
+    prep_embedding_model: str = 'sentence-transformers/all-MiniLM-L6-v2',
+    prep_num_chunks_for_embed: int = 80,
+    prep_num_hard_negative_books: int = 50,
+    prep_n_positive_per_book: int = 20,
+    prep_n_negative_per_book: int = 40,
+):
+    """Cost-effective training with automatic checkpoint resumption.
+
+    Uses 4x A100 GPUs (cheaper than H200s) with Modal's retry mechanism
+    for training runs that may exceed 24 hours. Automatically resumes
+    from the latest checkpoint on each retry.
+
+    Cost comparison vs 8x H200:
+    - ~3-4x cheaper per hour
+    - May take 2-3x longer wall time
+    - Auto-resumes if timeout hit
+    """
+    import subprocess
+    import os as _os
+
+    _ensure_dirs()
+
+    # Data preparation (skip if already exists)
+    if prepare_before_train:
+        _ds_ready = _os.path.exists(_os.path.join(data_subdir, 'train')) and _os.path.exists(_os.path.join(data_subdir, 'validation'))
+        if not _ds_ready:
+            print("=== Running data preparation ===")
+            ann_dir = "/vol/models/book_matcher_contrastive/final"
+            ann_ok = _os.path.exists(f"{ann_dir}/pytorch_model.bin") or _os.path.exists(f"{ann_dir}/model.safetensors")
+            try:
+                prepare_remote_gpu.remote(
+                    training_dir=prepare_training_dir,
+                    chunk_size=prep_chunk_size,
+                    overlap=prep_overlap,
+                    train_ratio=prep_train_ratio,
+                    val_ratio=prep_val_ratio,
+                    max_chunks_per_book=prep_max_chunks_per_book,
+                    use_hard_negatives=prep_use_hard_negatives,
+                    use_embedding_hard_negatives=prep_use_embedding_hard_negatives,
+                    embedding_model=prep_embedding_model,
+                    num_chunks_for_embed=prep_num_chunks_for_embed,
+                    num_hard_negative_books=prep_num_hard_negative_books,
+                    n_positive_per_book=prep_n_positive_per_book,
+                    n_negative_per_book=prep_n_negative_per_book,
+                    use_model_mined_negatives=ann_ok,
+                    use_ann_chunk_negatives=ann_ok,
+                    ann_miner_model_dir=(ann_dir if ann_ok else None),
+                    miner_model_dir=(ann_dir if ann_ok else None),
+                )
+            except Exception as e:
+                print(f"Warning: prepare_remote_gpu failed with miners, retrying without: {e}")
+                prepare_remote_gpu.remote(
+                    training_dir=prepare_training_dir,
+                    chunk_size=prep_chunk_size,
+                    overlap=prep_overlap,
+                    train_ratio=prep_train_ratio,
+                    val_ratio=prep_val_ratio,
+                    max_chunks_per_book=prep_max_chunks_per_book,
+                    use_hard_negatives=prep_use_hard_negatives,
+                    use_embedding_hard_negatives=prep_use_embedding_hard_negatives,
+                    embedding_model=prep_embedding_model,
+                    num_chunks_for_embed=prep_num_chunks_for_embed,
+                    num_hard_negative_books=prep_num_hard_negative_books,
+                    n_positive_per_book=prep_n_positive_per_book,
+                    n_negative_per_book=prep_n_negative_per_book,
+                    use_model_mined_negatives=False,
+                    use_ann_chunk_negatives=False,
+                )
+            print("Data preparation complete.")
+        else:
+            print("Dataset already exists, skipping preparation.")
+
+    # Build training command with --resume flag for auto-checkpoint detection
+    cmd = [
+        "torchrun",
+        "--nproc_per_node", "4",  # Match GPU count
+        "--master_port", "29500",
+        "/workspace/train_contrastive.py",
+        "--data-dir", data_subdir,
+        "--output-dir", output_subdir,
+        "--model", model_name,
+        "--epochs", str(num_epochs),
+        "--batch-size", str(batch_size),
+        "--lr", str(learning_rate),
+        "--warmup-steps", str(warmup_steps),
+        "--grad-accum", str(grad_accum_steps),
+        "--max-length", str(max_length),
+        "--pooling", pooling,
+        "--contrastive-mode", contrastive_mode,
+        "--supcon-temperature", str(supcon_temperature),
+        "--label-smoothing", str(label_smoothing),
+        "--select-metric", select_metric,
+        "--eval-strategy", eval_strategy,
+        "--save-strategy", save_strategy,
+        "--logging-steps", str(logging_steps),
+        "--eval-batch-multiplier", str(eval_batch_multiplier),
+        "--contrastive-weight", str(contrastive_weight),
+        "--adv-lambda", str(adv_lambda),
+        "--resume",  # Auto-detect and resume from latest checkpoint
+    ]
+    if use_projection:
+        pass  # default
+    else:
+        cmd.append("--no-projection")
+    if contrastive_only:
+        cmd.append("--contrastive-only")
+    if use_topic_adversary:
+        pass  # default
+    else:
+        cmd.append("--no-topic-adversary")
+    if grad_checkpointing:
+        cmd.append("--grad-ckpt")
+
+    print(f"Running: {' '.join(cmd)}")
+    result = subprocess.run(cmd, cwd="/workspace")
+
+    # Commit volume after training (persists checkpoints for next retry if needed)
+    artifacts_vol.commit()
+
+    if result.returncode != 0:
+        raise RuntimeError(f"Training failed with return code {result.returncode}")
+
+    print("Budget training complete (or checkpoint saved for resumption).")
 
 
 # --------------------- Multi-GPU training via torchrun ----------------------
@@ -1206,7 +1913,7 @@ def train_contrastive_remote_gpu(
     volumes={"/vol": artifacts_vol, "/input": training_vol},
     secrets=[],
     gpu=_GPU_H200_2,
-    timeout=60 * 60 * 12,
+    timeout=60 * 60 * 24,  # 24 hours (Modal max)
     env={**COMMON_ENV, "PYTHONPATH": "/workspace"},
 )
 def train_contrastive_remote_multi_gpu(
@@ -1215,15 +1922,16 @@ def train_contrastive_remote_multi_gpu(
     # Core training params
     model_name: str = "roberta-large",
     num_epochs: int = 6,
-    batch_size: int = 16,
-    learning_rate: float = 1e-5,
+    batch_size: int = 32,
+    learning_rate: float = 2e-5,
     warmup_steps: int = 1000,
-    use_style_features: bool = True,
-    use_symmetric_features: bool = True,
+    # Style/symmetric features disabled by default (not used in contrastive-only mode)
+    use_style_features: bool = False,
+    use_symmetric_features: bool = False,
     data_subdir: str = "/vol/data/processed",
-    output_subdir: str = "/vol/models/book_matcher_contrastive",
+    output_subdir: str = "/vol/models/style_embedder",
     contrastive_weight: float = 0.3,
-    # Distillation & calibration
+    # Distillation & calibration (not used in contrastive-only mode)
     distill_from_cross: bool = False,
     teacher_model_dir: str = "/vol/models/book_matcher/final",
     distill_weight: float = 0.5,
@@ -1240,13 +1948,14 @@ def train_contrastive_remote_multi_gpu(
     arcface_margin: float = 0.25,
     arcface_scale: float = 30.0,
     contrastive_mode: str = "supcon",
+    supcon_temperature: float = 0.07,
     max_length: int = 384,
     grad_checkpointing: bool = True,
     # Tokenization (None -> auto)
     tokenize_workers: int | None = None,
     # Optional: run prepare automatically if dataset missing
     prepare_before_train: bool = True,
-    prepare_training_dir: str = "/input/training",
+    prepare_training_dir: str = "/input/training_clean/gutenberg",
     # Prepare params (subset)
     prep_chunk_size: int = 14,
     prep_overlap: int = 4,
@@ -1260,6 +1969,13 @@ def train_contrastive_remote_multi_gpu(
     prep_num_hard_negative_books: int = 50,
     prep_n_positive_per_book: int = 20,
     prep_n_negative_per_book: int = 40,
+    # Contrastive-only mode - pure embedding learning, no classifier (DEFAULT)
+    contrastive_only: bool = True,
+    # Fine-tuning: initialize from a previous checkpoint
+    init_from: str | None = None,
+    # Topic adversary for style/content disentanglement (ON by default for proper style learning)
+    use_topic_adversary: bool = True,
+    adv_lambda: float = 0.7,
 ):
     """Run contrastive training on 2 GPUs using torchrun with epoch-level eval/save.
 
@@ -1367,7 +2083,7 @@ def train_contrastive_remote_multi_gpu(
         "--arcface-margin", str(float(arcface_margin)),
         "--arcface-scale", str(float(arcface_scale)),
         "--contrastive-mode", str(contrastive_mode),
-        "--supcon-temperature", str(0.1),
+        "--supcon-temperature", str(float(supcon_temperature)),
         "--compile",
     ]
     # Optional flags
@@ -1377,6 +2093,16 @@ def train_contrastive_remote_multi_gpu(
         cmd.append("--no-symmetric-head")
     if not use_projection:
         cmd.append("--no-projection")
+    if contrastive_only:
+        cmd.append("--contrastive-only")
+    # Fine-tuning: load weights from previous checkpoint
+    if init_from:
+        cmd.extend(["--init-from", str(init_from)])
+    # Topic adversary for style/content disentanglement
+    if not use_topic_adversary:
+        cmd.append("--no-topic-adversary")
+    else:
+        cmd.extend(["--adv-lambda", str(float(adv_lambda))])
     # grad_checkpointing is not exposed via CLI; rely on default in train_contrastive()
     # Tokenization workers via environment since CLI may not expose it
     env = {**_os.environ}
@@ -1420,7 +2146,7 @@ def train_contrastive_remote_four_gpu_h100(
     tokenize_workers: int | None = None,
     # Optional prepare
     prepare_before_train: bool = True,
-    prepare_training_dir: str = "/input/training",
+    prepare_training_dir: str = "/input/training_clean/gutenberg",
 ):
     import os as _os
     import subprocess as _sp
@@ -1452,13 +2178,11 @@ def train_contrastive_remote_four_gpu_h100(
         "--batch-size", str(int(batch_size)),
         "--lr", str(float(learning_rate)),
         "--grad-accum", "2",
-        "--label-smoothing", "0.03",
         "--pooling", "attn",
-        "--select-metric", "auc",
-        "--arcface-margin", "0.25",
-        "--arcface-scale", "30.0",
         "--contrastive-mode", "supcon",
-        "--supcon-temperature", "0.1",
+        "--supcon-temperature", "0.07",
+        "--contrastive-only",  # Pure embedding learning for style similarity
+        "--adv-lambda", "0.4",  # Topic adversary for style/content disentanglement
         "--compile",
     ]
     env = {**_os.environ}
@@ -1498,7 +2222,7 @@ def train_contrastive_remote_four_gpu_h200(
     tokenize_workers: int | None = None,
     # Optional prepare
     prepare_before_train: bool = True,
-    prepare_training_dir: str = "/input/training",
+    prepare_training_dir: str = "/input/training_clean/gutenberg",
 ):
     import os as _os
     import subprocess as _sp
@@ -1528,13 +2252,11 @@ def train_contrastive_remote_four_gpu_h200(
         "--batch-size", str(int(batch_size)),
         "--lr", str(float(learning_rate)),
         "--grad-accum", "2",
-        "--label-smoothing", "0.03",
         "--pooling", "attn",
-        "--select-metric", "auc",
-        "--arcface-margin", "0.25",
-        "--arcface-scale", "30.0",
         "--contrastive-mode", "supcon",
-        "--supcon-temperature", "0.1",
+        "--supcon-temperature", "0.07",
+        "--contrastive-only",  # Pure embedding learning for style similarity
+        "--adv-lambda", "0.4",  # Topic adversary for style/content disentanglement
         "--compile",
     ]
     env = {**_os.environ}
@@ -1574,7 +2296,7 @@ def train_contrastive_remote_four_gpu_a100(
     tokenize_workers: int | None = None,
     # Optional prepare
     prepare_before_train: bool = True,
-    prepare_training_dir: str = "/input/training",
+    prepare_training_dir: str = "/input/training_clean/gutenberg",
 ):
     import os as _os
     import subprocess as _sp
@@ -1604,13 +2326,11 @@ def train_contrastive_remote_four_gpu_a100(
         "--batch-size", str(int(batch_size)),
         "--lr", str(float(learning_rate)),
         "--grad-accum", "2",
-        "--label-smoothing", "0.03",
         "--pooling", "attn",
-        "--select-metric", "auc",
-        "--arcface-margin", "0.25",
-        "--arcface-scale", "30.0",
         "--contrastive-mode", "supcon",
-        "--supcon-temperature", "0.1",
+        "--supcon-temperature", "0.07",
+        "--contrastive-only",  # Pure embedding learning for style similarity
+        "--adv-lambda", "0.4",  # Topic adversary for style/content disentanglement
         "--compile",
     ]
     env = {**_os.environ}
@@ -1650,7 +2370,7 @@ def train_contrastive_remote_eight_gpu_h100(
     tokenize_workers: int | None = None,
     # Optional prepare
     prepare_before_train: bool = True,
-    prepare_training_dir: str = "/input/training",
+    prepare_training_dir: str = "/input/training_clean/gutenberg",
 ):
     import os as _os
     import subprocess as _sp
@@ -1680,13 +2400,12 @@ def train_contrastive_remote_eight_gpu_h100(
         "--batch-size", str(int(batch_size)),
         "--lr", str(float(learning_rate)),
         "--grad-accum", "2",
-        "--label-smoothing", "0.03",
         "--pooling", "attn",
-        "--select-metric", "auc",
-        "--arcface-margin", "0.25",
-        "--arcface-scale", "30.0",
         "--contrastive-mode", "supcon",
-        "--supcon-temperature", "0.1",
+        "--supcon-temperature", "0.07",
+        "--contrastive-only",  # Pure embedding learning for style similarity
+        "--adv-lambda", "0.4",  # Topic adversary for style/content disentanglement
+        "--compile",
     ]
     env = {**_os.environ}
     env["TOKENIZE_WORKERS"] = str(int(_tok_workers))
@@ -1703,6 +2422,7 @@ def train_contrastive_remote_eight_gpu_h100(
     volumes={"/vol": artifacts_vol, "/input": training_vol},
     secrets=[],
     gpu=_GPU_H200_8,
+    cpu=16,
     timeout=60 * 60 * 24,
     env={**COMMON_ENV, "PYTHONPATH": "/workspace"},
 )
@@ -1712,22 +2432,15 @@ def train_contrastive_remote_eight_gpu_h200(
     num_epochs: int = 6,
     batch_size: int = 16,
     learning_rate: float = 1e-5,
-    warmup_steps: int = 1000,
-    use_style_features: bool = True,
-    use_symmetric_features: bool = True,
     data_subdir: str = "/vol/data/processed",
     output_subdir: str = "/vol/models/book_matcher_contrastive",
-    contrastive_weight: float = 0.3,
-    # Distillation & calibration
-    distill_from_cross: bool = False,
-    teacher_model_dir: str = "/vol/models/book_matcher/final",
     # Tokenization (None -> auto)
     tokenize_workers: int | None = None,
     # Optimizer/throughput tuning
     grad_accum_steps: int = 2,
     # Optional prepare
     prepare_before_train: bool = True,
-    prepare_training_dir: str = "/input/training",
+    prepare_training_dir: str = "/input/training_clean/gutenberg",
 ):
     import os as _os
     import subprocess as _sp
@@ -1757,14 +2470,13 @@ def train_contrastive_remote_eight_gpu_h200(
         "--batch-size", str(int(batch_size)),
         "--lr", str(float(learning_rate)),
         "--grad-accum", str(int(grad_accum_steps)),
-        "--label-smoothing", "0.03",
         "--pooling", "attn",
-        "--select-metric", "auc",
-        "--arcface-margin", "0.25",
-        "--arcface-scale", "30.0",
         "--contrastive-mode", "supcon",
-        "--supcon-temperature", "0.1",
+        "--supcon-temperature", "0.07",
+        "--contrastive-only",  # Pure embedding learning for style similarity
+        "--adv-lambda", "0.4",  # Topic adversary for style/content disentanglement
         "--compile",
+        "--eval-batch-multiplier", "8",
     ]
     env = {**_os.environ}
     # Conservative setting that often improves DDP kernel scheduling on Hopper
@@ -1774,6 +2486,79 @@ def train_contrastive_remote_eight_gpu_h200(
     rc = _sp.call(cmd, env=env)
     if rc != 0:
         raise RuntimeError(f"torchrun (8x H200) exited with code {rc}")
+    return {"status": "ok", "nproc": 8, "output": str(output_subdir)}
+
+
+# --------------------- 8x GPU (B200) via torchrun ---------------------------
+@app.function(
+    image=image_gpu_b200,
+    volumes={"/vol": artifacts_vol, "/input": training_vol},
+    secrets=[],
+    gpu=_GPU_B200_8,
+    cpu=16,
+    timeout=60 * 60 * 24,
+    env={**COMMON_ENV, "PYTHONPATH": "/workspace"},
+)
+def train_contrastive_remote_eight_gpu_b200(
+    # Core training params
+    model_name: str = "roberta-large",
+    num_epochs: int = 6,
+    batch_size: int = 24,  # B200 has more VRAM, can use larger batch
+    learning_rate: float = 1e-5,
+    data_subdir: str = "/vol/data/processed",
+    output_subdir: str = "/vol/models/book_matcher_contrastive",
+    # Tokenization (None -> auto)
+    tokenize_workers: int | None = None,
+    # Optimizer/throughput tuning
+    grad_accum_steps: int = 2,
+    # Optional prepare
+    prepare_before_train: bool = True,
+    prepare_training_dir: str = "/input/training_clean/gutenberg",
+):
+    import os as _os
+    import subprocess as _sp
+    _ensure_dirs()
+
+    if prepare_before_train:
+        _ds_dir = data_subdir
+        _ds_ready = _os.path.exists(_os.path.join(_ds_dir, 'train')) and _os.path.exists(_os.path.join(_ds_dir, 'validation'))
+        if not _ds_ready:
+            try:
+                prepare_remote_gpu.remote(training_dir=prepare_training_dir)
+            except Exception as e:
+                print({"warning": f"prepare_remote failed: {e}"})
+
+    try:
+        _auto_workers = max(1, int(_os.cpu_count() or 1))
+    except Exception:
+        _auto_workers = 1
+    _tok_workers = _auto_workers if (tokenize_workers is None or int(tokenize_workers) <= 0) else int(tokenize_workers)
+
+    cmd = [
+        "torchrun", "--standalone", "--nproc_per_node=8", "-m", "train_contrastive",
+        "--model", str(model_name),
+        "--output", str(output_subdir),
+        "--data", str(data_subdir),
+        "--epochs", str(int(num_epochs)),
+        "--batch-size", str(int(batch_size)),
+        "--lr", str(float(learning_rate)),
+        "--grad-accum", str(int(grad_accum_steps)),
+        "--pooling", "attn",
+        "--contrastive-mode", "supcon",
+        "--supcon-temperature", "0.07",
+        "--contrastive-only",  # Pure embedding learning for style similarity
+        "--adv-lambda", "0.4",  # Topic adversary for style/content disentanglement
+        "--compile",
+        "--eval-batch-multiplier", "8",
+    ]
+    env = {**_os.environ}
+    # Conservative setting that often improves DDP kernel scheduling on Blackwell
+    env.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")
+    env["TOKENIZE_WORKERS"] = str(int(_tok_workers))
+    print({"torchrun": cmd, "TOKENIZE_WORKERS": env.get("TOKENIZE_WORKERS")})
+    rc = _sp.call(cmd, env=env)
+    if rc != 0:
+        raise RuntimeError(f"torchrun (8x B200) exited with code {rc}")
     return {"status": "ok", "nproc": 8, "output": str(output_subdir)}
 
 
@@ -1807,7 +2592,7 @@ def train_contrastive_remote_eight_gpu_a100(
     grad_accum_steps: int = 2,
     # Optional prepare
     prepare_before_train: bool = True,
-    prepare_training_dir: str = "/input/training",
+    prepare_training_dir: str = "/input/training_clean/gutenberg",
 ):
     import os as _os
     import subprocess as _sp
@@ -1837,13 +2622,11 @@ def train_contrastive_remote_eight_gpu_a100(
         "--batch-size", str(int(batch_size)),
         "--lr", str(float(learning_rate)),
         "--grad-accum", str(int(grad_accum_steps)),
-        "--label-smoothing", "0.03",
         "--pooling", "attn",
-        "--select-metric", "auc",
-        "--arcface-margin", "0.25",
-        "--arcface-scale", "30.0",
         "--contrastive-mode", "supcon",
-        "--supcon-temperature", "0.1",
+        "--supcon-temperature", "0.07",
+        "--contrastive-only",  # Pure embedding learning for style similarity
+        "--adv-lambda", "0.4",  # Topic adversary for style/content disentanglement
         "--compile",
     ]
     env = {**_os.environ}
@@ -2114,92 +2897,17 @@ def compute_book_embeddings_remote_gpu(
     volumes={"/vol": artifacts_vol, "/input": training_vol},
     secrets=[],
     timeout=60 * 60 * 12,
-    cpu=8,
-    memory=16384,
-    env={**COMMON_ENV, "PYTHONPATH": "/workspace"},
-)
-def calibrate_contrastive_remote(
-    model_dir: str = "/vol/models/book_matcher_contrastive/final",
-    data_subdir: str = "/vol/data/processed",
-    calibrate_for: str = "accuracy",
-    target_acc: float | None = None,
-    target_recall: float | None = 0.85,
-    save_to: str | None = None,
-    batch_size: int = 128,
-    num_proc: int = 4,
-    num_workers: int = 2,
-    max_length: int = 512,
-):
-    from calibrate_contrastive import calibrate_contrastive as _cal
-    _ensure_dirs()
-    _cal(
-        model_dir=model_dir,
-        data_dir=data_subdir,
-        calibrate_for=calibrate_for,
-        target_acc=target_acc,
-        target_recall=target_recall,
-        save_to=save_to,
-        batch_size=batch_size,
-        num_proc=num_proc,
-        num_workers=num_workers,
-        max_length=max_length,
-    )
-    return {"status": "calibration complete", "model_dir": model_dir}
-
-
-@app.function(
-    image=image_gpu,
-    volumes={"/vol": artifacts_vol, "/input": training_vol},
-    secrets=[],
-    gpu=_GPU_H200_1,
-    cpu=8,
-    timeout=60 * 60 * 12,
-    env={**COMMON_ENV, "PYTHONPATH": "/workspace"},
-)
-def calibrate_contrastive_remote_gpu(
-    model_dir: str = "/vol/models/book_matcher_contrastive/final",
-    data_subdir: str = "/vol/data/processed",
-    calibrate_for: str = "accuracy",
-    target_acc: float | None = None,
-    target_recall: float | None = 0.85,
-    save_to: str | None = None,
-    batch_size: int = 512,
-    num_proc: int = 4,
-    num_workers: int = 4,
-    max_length: int = 512,
-):
-    from calibrate_contrastive import calibrate_contrastive as _cal
-    _ensure_dirs()
-    _cal(
-        model_dir=model_dir,
-        data_dir=data_subdir,
-        calibrate_for=calibrate_for,
-        target_acc=target_acc,
-        target_recall=target_recall,
-        save_to=save_to,
-        batch_size=batch_size,
-        num_proc=num_proc,
-        num_workers=num_workers,
-    )
-    return {"status": "calibration complete (GPU)", "model_dir": model_dir}
-
-
-@app.function(
-    image=image_cpu,
-    volumes={"/vol": artifacts_vol, "/input": training_vol},
-    secrets=[],
-    timeout=60 * 60 * 12,
     env={**COMMON_ENV, "PYTHONPATH": "/workspace"},
 )
 def evaluate_contrastive_remote(
     model_dir: str = "/vol/models/book_matcher_contrastive/final",
     data_subdir: str = "/vol/data/processed",
-    calibration_path: str | None = None,
+    threshold: float = 0.5,
     max_length: int = 512,
 ):
     from evaluate_contrastive import evaluate_contrastive as _eval
     _ensure_dirs()
-    return _eval(model_dir=model_dir, data_dir=data_subdir, calibration_path=calibration_path, max_length=max_length)
+    return _eval(model_dir=model_dir, data_dir=data_subdir, threshold=threshold, max_length=max_length)
 
 
 @app.function(
@@ -3503,6 +4211,168 @@ def calibrate_style_gpu():
 @app.function(
     image=image_gpu,
     volumes={"/vol": artifacts_vol, "/input": training_vol},
+    secrets=[],
+    gpu=_GPU_H200_1,
+    timeout=60 * 60 * 6,
+    env={**COMMON_ENV, "PYTHONPATH": "/workspace"},
+)
+def same_book_similarity_remote_gpu(
+    book: str,
+    model_dir: str = "/vol/models/book_matcher_contrastive/final",
+    n_pairs: int = 20,
+    n_sentences: int = 20,
+    seed: int = 42,
+    num_chunks = 'auto',
+    chunk_size: int = 14,
+    overlap: int = 4,
+    aggregate: str = "mean",
+    topk: int = 5,
+    max_length: int = 512,
+    max_pairs_logged: int = 0,
+    return_pairs: bool = False,
+):
+    """Sample same-book passages (long excerpts) and report average style similarity (GPU).
+
+    Excerpts use the same picker as the LLM benchmark (`eval.benchmark_style`), with longer
+    n_sentences by default to avoid sentence-level matches.
+    """
+    import os as _os
+    import math as _math
+    import random as _random
+    import statistics as _stats
+    from eval.benchmark_style import _pick_excerpt as _pick, _split_sentences_simple as _split
+    from inference_contrastive import ContrastiveBookMatcherInference
+
+    # Resolve book path
+    book_path = book
+    if not _os.path.isabs(book_path):
+        cand1 = _os.path.join("/workspace", book_path)
+        cand2 = _os.path.join("/workspace/eval/books", book_path)
+        for c in (cand1, cand2):
+            if _os.path.exists(c):
+                book_path = c
+                break
+    if not _os.path.exists(book_path):
+        raise FileNotFoundError(f"Book not found: {book}")
+
+    raw = open(book_path, "r", encoding="utf-8", errors="ignore").read()
+    sents = _split(raw)
+    if not sents:
+        raise ValueError(f"No sentences detected in book: {book_path}")
+
+    rng = _random.Random(seed)
+    matcher = ContrastiveBookMatcherInference(model_dir)
+
+    def _stat(vals: list[float]) -> dict:
+        finite = [v for v in vals if _math.isfinite(v)]
+        if not finite:
+            nan = float("nan")
+            return {"mean": nan, "median": nan, "min": nan, "max": nan, "count": 0}
+        return {
+            "mean": float(sum(finite) / len(finite)),
+            "median": float(_stats.median(finite)),
+            "min": float(min(finite)),
+            "max": float(max(finite)),
+            "count": len(finite),
+        }
+
+    pair_results = []
+    for i in range(max(1, int(n_pairs))):
+        ex1, meta1 = _pick(raw, n_sentences=int(n_sentences), rng=rng)
+        ex2, meta2 = _pick(raw, n_sentences=int(n_sentences), rng=rng)
+        res = matcher.style_similarity(
+            ex1,
+            ex2,
+            num_chunks=num_chunks,
+            chunk_size=int(chunk_size),
+            overlap=int(overlap),
+            aggregate=aggregate,
+            topk=int(topk),
+            max_length=int(max_length),
+        )
+        cos = float(res.get("cosine", float("nan")))
+        mapped = (cos + 1.0) / 2.0 if _math.isfinite(cos) else float("nan")
+        cal = res.get("calibrated")
+        pair_results.append(
+            {
+                "index": i + 1,
+                "cosine": cos,
+                "score_0_1": mapped,
+                "calibrated": (float(cal) if cal is not None else None),
+                "pairs": int(res.get("pairs", 0)),
+                "excerpt1": meta1,
+                "excerpt2": meta2,
+            }
+        )
+
+    cos_vals = [p["cosine"] for p in pair_results]
+    mapped_vals = [p["score_0_1"] for p in pair_results]
+    cal_vals = [p["calibrated"] for p in pair_results if p.get("calibrated") is not None]
+
+    summary = {
+        "book": book_path,
+        "model_dir": model_dir,
+        "n_pairs": int(n_pairs),
+        "n_sentences": int(n_sentences),
+        "seed": int(seed),
+        "num_chunks": num_chunks,
+        "chunk_size": int(chunk_size),
+        "overlap": int(overlap),
+        "aggregate": aggregate,
+        "topk": int(topk),
+        "max_length": int(max_length),
+        "cosine_stats": _stat(cos_vals),
+        "score_0_1_stats": _stat(mapped_vals),
+        "calibrated_stats": (_stat(cal_vals) if cal_vals else None),
+    }
+
+    print({"summary": summary})
+    # Optional limited logging of per-pair scores
+    max_log = max(0, int(max_pairs_logged))
+    if max_log:
+        logged_pairs = pair_results[:max_log]
+        if logged_pairs:
+            print({"sample_pairs": logged_pairs})
+    if return_pairs:
+        return {"summary": summary, "pairs": pair_results}
+    return {"summary": summary}
+
+
+@app.local_entrypoint()
+def same_book_similarity(
+    book: str = "eval/books/gatsby.txt",
+    n_pairs: int = 20,
+    n_sentences: int = 20,
+    num_chunks = 'auto',
+    chunk_size: int = 14,
+    overlap: int = 4,
+    aggregate: str = "mean",
+    topk: int = 5,
+    max_length: int = 512,
+    model_dir: str = "/vol/models/book_matcher_contrastive/final",
+    log_pairs: int = 0,
+    return_pairs: bool = False,
+):
+    """CLI helper: modal run modal_app.py::same_book_similarity -- --book eval/books/gatsby.txt --n-pairs 50"""
+    return same_book_similarity_remote_gpu.remote(
+        book=book,
+        model_dir=model_dir,
+        n_pairs=n_pairs,
+        n_sentences=n_sentences,
+        num_chunks=num_chunks,
+        chunk_size=chunk_size,
+        overlap=overlap,
+        aggregate=aggregate,
+        topk=topk,
+        max_length=max_length,
+        max_pairs_logged=log_pairs,
+        return_pairs=return_pairs,
+    )
+
+
+@app.function(
+    image=image_gpu,
+    volumes={"/vol": artifacts_vol, "/input": training_vol},
     secrets=[modal.Secret.from_name("llm-api-keys")],
     gpu=_GPU_H200_1,
     timeout=60 * 60 * 12,
@@ -4028,7 +4898,7 @@ def train_contrastive(
 def train_contrastive_gpu(
     model: str = "roberta-large",
     epochs: int = 6,
-    batch_size: int = 8,
+    batch_size: int = 20,
     lr: float = 1e-5,
     warmup_steps: int = 1000,
     use_style_features: bool = True,
@@ -4036,7 +4906,8 @@ def train_contrastive_gpu(
     data_subdir: str = "/vol/data/processed",
     output_subdir: str = "/vol/models/book_matcher_contrastive",
     contrastive_weight: float = 0.3,
-    distill_from_cross: bool = True,
+    # Disable distillation by default for speed (quality-neutral with current setup)
+    distill_from_cross: bool = False,
     teacher_model_dir: str = "/vol/models/book_matcher/final",
     distill_weight: float = 0.5,
     distill_temperature: float = 3.0,
@@ -4046,16 +4917,20 @@ def train_contrastive_gpu(
     pooling: str = "attn",
     use_projection: bool = True,
     label_smoothing: float = 0.03,
-    grad_accum_steps: int = 2,
-    select_metric: str = "balanced_accuracy",
+    grad_accum_steps: int = 1,
+    # Match remote GPU defaults used for best-checkpoint selection
+    select_metric: str = "auc",
     classifier: str = "arcface",
     arcface_margin: float = 0.25,
     arcface_scale: float = 30.0,
     contrastive_mode: str = "supcon",
-    max_length: int = 512,
-    grad_checkpointing: bool = True,
+    # 384 keeps quality while improving throughput vs 512
+    max_length: int = 384,
+    # Turn off CKPT on H200 for speed (ample VRAM); re-enable manually if needed
+    grad_checkpointing: bool = False,
     teacher_on_gpu: bool = True,
-    tokenize_workers: int = 4,
+    # Use all available vCPUs by default
+    tokenize_workers: int | None = None,
 ):
     return train_contrastive_remote_gpu.remote(
         model_name=model,
@@ -4096,31 +4971,27 @@ def train_contrastive_eight_gpu_h200(
     model: str = "roberta-large",
     num_epochs: int = 6,
     batch_size: int = 64,
+    grad_accum_steps: int = 1,
     lr: float = 2e-5,
-    warmup_steps: int = 1000,
-    use_style_features: bool = True,
-    use_symmetric_features: bool = True,
     data_subdir: str = "/vol/data/processed",
     output_subdir: str = "/vol/models/book_matcher_contrastive",
     # Optional prepare
     prepare_before_train: bool = True,
-    prepare_training_dir: str = "/input/training",
+    prepare_training_dir: str = "/input/training_clean/gutenberg",
     # Tokenization (None -> auto)
     tokenize_workers: int | None = None,
 ):
-    """Local CLI wrapper for 8x H200 training.
+    """Local CLI wrapper for 8x H200 contrastive-only training.
 
     Example:
-    modal run modal_app.py::train_contrastive_eight_gpu_h200 -- --prepare-before-train=false --epochs 6 --batch-size 64
+    modal run modal_app.py::train_contrastive_eight_gpu_h200 -- --num-epochs 6 --batch-size 64
     """
     return train_contrastive_remote_eight_gpu_h200.remote(
         model_name=model,
         num_epochs=num_epochs,
         batch_size=batch_size,
+        grad_accum_steps=grad_accum_steps,
         learning_rate=lr,
-        warmup_steps=warmup_steps,
-        use_style_features=use_style_features,
-        use_symmetric_features=use_symmetric_features,
         data_subdir=data_subdir,
         output_subdir=output_subdir,
         prepare_before_train=prepare_before_train,
@@ -4282,17 +5153,6 @@ def pipeline_contrastive(
         # Avoid double prepare in pipeline
         prepare_before_train=False,
     )
-    # Calibrate contrastive classifier (temperature + threshold) on GPU
-    calibrate_contrastive_remote_gpu.remote(
-        model_dir=f"{output_subdir}/final",
-        data_subdir=data_subdir,
-        calibrate_for="accuracy",
-        target_recall=0.85,
-        batch_size=512,
-        num_proc=4,
-        num_workers=4,
-        max_length=max_length,
-    )
     # Calibrate style similarity on GPU (auto-generates pairs if needed)
     calibrate_style_similarity_remote_gpu.remote(
         model_dir=f"{output_subdir}/final",
@@ -4305,7 +5165,7 @@ def pipeline_contrastive(
         force_generate=True,
     )
     # Cross-encoder training is triggered by train_contrastive_remote_gpu by default.
-    return {"status": "pipeline_contrastive completed: prepared + trained contrastive + calibrated classifier + calibrated style"}
+    return {"status": "pipeline_contrastive completed: prepared + trained contrastive + calibrated style"}
 
 
 # One-click: prepare -> train contrastive (GPU) -> calibrate style similarity (GPU)
@@ -4343,17 +5203,7 @@ def pipeline_style(
         # Avoid double prepare in pipeline
         prepare_before_train=False,
     )
-    # 3) Calibrate contrastive classifier (GPU)
-    calibrate_contrastive_remote_gpu.remote(
-        model_dir=model_dir,
-        data_subdir=dataset_dir,
-        calibrate_for="accuracy",
-        target_recall=0.85,
-        batch_size=512,
-        num_proc=4,
-        num_workers=4,
-    )
-    # 4) Calibrate style similarity (auto-select, GPU)
+    # 3) Calibrate style similarity (auto-select, GPU)
     calibrate_style_similarity_remote_gpu.remote(
         model_dir=model_dir,
         pairs_csv="/vol/data/style_pairs_autogen.csv",
@@ -4365,7 +5215,7 @@ def pipeline_style(
         pairs_per_class=5000,
         force_generate=True,
     )
-    return {"status": "pipeline_style completed: prepared + trained + calibrated classifier + calibrated style"}
+    return {"status": "pipeline_style completed: prepared + trained + calibrated style"}
 # Inference (contrastive)
 @app.function(
     image=image_cpu,
@@ -4398,106 +5248,16 @@ def infer_contrastive(
     return infer_contrastive_remote.remote(text1=text1, text2=text2, model_dir=model_dir, threshold=threshold)
 
 
-# Inference (two-stage: contrastive prefilter + cross-encoder rerank)
-@app.function(
-    image=image_cpu,
-    volumes={"/vol": artifacts_vol},
-    secrets=[],
-    timeout=60 * 10,
-    env={**COMMON_ENV, "PYTHONPATH": "/workspace"},
-)
-def infer_two_stage_remote(
-    text1: str,
-    text2: str,
-    bi_model_dir: str = "/vol/models/book_matcher_contrastive/final",
-    cross_model_dir: str = "/vol/models/book_matcher/final",
-    prefilter_threshold: float | None = None,
-    cross_threshold: float = 0.5,
-):
-    from inference_two_stage import TwoStageBookMatcher
-
-    matcher = TwoStageBookMatcher(
-        bi_model_dir=bi_model_dir,
-        cross_model_dir=cross_model_dir,
-        prefilter_threshold=prefilter_threshold,
-        cross_threshold=cross_threshold,
-    )
-    result = matcher.predict(text1, text2)
-    print({"result": result})
-    return result
-
-
-@app.local_entrypoint()
-def infer_two_stage(
-    text1: str,
-    text2: str,
-    bi_model_dir: str = "/vol/models/book_matcher_contrastive/final",
-    cross_model_dir: str = "/vol/models/book_matcher/final",
-    prefilter_threshold: float | None = None,
-    cross_threshold: float = 0.5,
-):
-    return infer_two_stage_remote.remote(
-        text1=text1,
-        text2=text2,
-        bi_model_dir=bi_model_dir,
-        cross_model_dir=cross_model_dir,
-        prefilter_threshold=prefilter_threshold,
-        cross_threshold=cross_threshold,
-    )
-
-
-@app.local_entrypoint()
-def calibrate_contrastive(
-    model_dir: str = "/vol/models/book_matcher_contrastive/final",
-    data_subdir: str = "/vol/data/processed",
-    calibrate_for: str = "accuracy",
-    target_acc: float | None = None,
-    target_recall: float | None = 0.85,
-    save_to: str | None = None,
-    max_length: int = 512,
-):
-    return calibrate_contrastive_remote.remote(
-        model_dir=model_dir,
-        data_subdir=data_subdir,
-        calibrate_for=calibrate_for,
-        target_acc=target_acc,
-        target_recall=target_recall,
-        save_to=save_to,
-        max_length=max_length,
-    )
-
-
-@app.local_entrypoint()
-def calibrate_contrastive_gpu(
-    model_dir: str = "/vol/models/book_matcher_contrastive/final",
-    data_subdir: str = "/vol/data/processed",
-    calibrate_for: str = "accuracy",
-    target_acc: float | None = None,
-    target_recall: float | None = 0.85,
-    save_to: str | None = None,
-    max_length: int = 512,
-):
-    return calibrate_contrastive_remote_gpu.remote(
-        model_dir=model_dir,
-        data_subdir=data_subdir,
-        calibrate_for=calibrate_for,
-        target_acc=target_acc,
-        target_recall=target_recall,
-        save_to=save_to,
-        max_length=max_length,
-    )
-
-
 @app.local_entrypoint()
 def evaluate_contrastive(
     model_dir: str = "/vol/models/book_matcher_contrastive/final",
     data_subdir: str = "/vol/data/processed",
-    calibration_path: str | None = None,
+    threshold: float = 0.5,
 ):
     return evaluate_contrastive_remote.remote(
         model_dir=model_dir,
         data_subdir=data_subdir,
-        calibration_path=calibration_path,
+        threshold=threshold,
         max_length=512,
     )
 
@@ -5309,7 +6069,8 @@ def _process_one_gutenberg(src_path: str, raw_root: str, out_root: str) -> dict 
     dst = dst_dir / f"{title_slug}.txt"
     if dst.exists():
         gid = _guess_gutenberg_id(src.name) or ""
-        alt = dst_dir / f"{_clip_slug(title_slug + f"__pg{gid or 'dup'}", 120)}.txt"
+        suffix = f"__pg{gid or 'dup'}"
+        alt = dst_dir / f"{_clip_slug(title_slug + suffix, 120)}.txt"
         dst = alt
 
     # Copy with cleaning

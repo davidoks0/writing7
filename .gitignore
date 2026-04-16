@@ -204,7 +204,12 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
-data/
-*.safetensors # or list the specific path
 
-training/*.txt
+# Project data & artifacts
+data/
+models/
+training/
+*.safetensors
+*.tsv
+*.log
+.DS_Store
