@@ -122,9 +122,8 @@ stylebench/
 │   ├── benchmark_schema.py
 │   ├── style_scoring.py
 │   ├── originality.py
-│   ├── prompt_adherence.py
 │   ├── fluency.py
-│   └── human_eval/
+│   └── ...
 ├── configs/
 │   ├── corpus_v1.json
 │   ├── scorer_train_v1.json
@@ -219,8 +218,7 @@ Inside `/artifacts`:
 │   └── diagnostics_v1.json
 ├── benchmark/
 │   ├── manifests/
-│   ├── reference_distributions/
-│   └── human_eval/
+│   └── reference_distributions/
 └── results/
     ├── benchmark_runs/
     └── summaries/

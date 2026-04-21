@@ -1,0 +1,47 @@
+{
+  "benchmark_version": "gutenberg_style_v1",
+  "builder_seed": 42,
+  "tracks": [
+    "author",
+    "book"
+  ],
+  "prompt_bank_path": "eval/benchmark_data/prompts_v1.json",
+  "generation_profiles": {
+    "leaderboard_v1": {
+      "temperature": 0.8,
+      "top_p": 0.95,
+      "max_tokens": 900,
+      "n_samples_per_case": 3,
+      "sample_seeds": [
+        11,
+        29,
+        47
+      ]
+    }
+  },
+  "passage_policy": {
+    "min_words": 150,
+    "max_words": 300,
+    "preferred_words": 220,
+    "min_sentences": 6,
+    "max_sentences": 18,
+    "region_buckets": 5
+  },
+  "distractor_policy": {
+    "target_count": 5,
+    "min_count": 5,
+    "book_track_same_author_policy": "prefer_other_author"
+  },
+  "originality_thresholds": {
+    "char_8gram_overlap_max": 0.3,
+    "token_lcs_ratio_max": 0.2,
+    "joint_char_overlap_threshold": 0.2,
+    "joint_lcs_threshold": 0.15
+  },
+  "fluency_thresholds": {
+    "min_words_valid": 350,
+    "max_words_valid": 1000,
+    "max_repetition_rate_6gram": 0.2
+  },
+  "bootstrap_resamples": 1000
+}

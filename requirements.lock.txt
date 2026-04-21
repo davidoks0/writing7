@@ -1,0 +1,15 @@
+anthropic==0.45.2
+huggingface-hub==0.27.1
+modal==1.1.4
+numpy==2.0.2
+openai==1.59.7
+requests==2.32.3
+safetensors==0.5.2
+scikit-learn==1.6.1
+scipy==1.13.1
+sentence-transformers==3.3.1
+tenacity==9.0.0
+torch==2.5.1
+tqdm==4.67.1
+transformers==4.48.1
+pytest==8.3.4

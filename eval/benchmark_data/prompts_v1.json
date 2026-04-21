@@ -1,0 +1,178 @@
+[
+  {
+    "family": "ambition_failure",
+    "prompt_id": "prompt:ambition_failure:01",
+    "required_keywords": [
+      "character",
+      "decide",
+      "plan",
+      "fail"
+    ],
+    "text": "Write a scene in which a character must decide whether to persist in a plan that is clearly beginning to fail."
+  },
+  {
+    "family": "ambition_failure",
+    "prompt_id": "prompt:ambition_failure:02",
+    "required_keywords": [
+      "opportunity",
+      "favorable",
+      "cost",
+      "unspoken"
+    ],
+    "text": "Write a scene in which a person receives an opportunity that appears favorable but carries an unspoken cost."
+  },
+  {
+    "family": "domestic_tension",
+    "prompt_id": "prompt:domestic_tension:01",
+    "required_keywords": [
+      "domestic",
+      "routine",
+      "news",
+      "discuss"
+    ],
+    "text": "Write a domestic scene in which a routine task is interrupted by news that no one is ready to discuss plainly."
+  },
+  {
+    "family": "domestic_tension",
+    "prompt_id": "prompt:domestic_tension:02",
+    "required_keywords": [
+      "household",
+      "disagreement",
+      "larger",
+      "unease"
+    ],
+    "text": "Write a household scene in which a minor disagreement exposes a much larger unease."
+  },
+  {
+    "family": "interpersonal",
+    "prompt_id": "prompt:interpersonal:01",
+    "required_keywords": [
+      "two",
+      "people",
+      "conceal",
+      "grievance"
+    ],
+    "text": "Write a scene in which two people who know each other well speak politely while both conceal a serious grievance."
+  },
+  {
+    "family": "interpersonal",
+    "prompt_id": "prompt:interpersonal:02",
+    "required_keywords": [
+      "companion",
+      "help",
+      "withholds",
+      "fact"
+    ],
+    "text": "Write a scene in which a trusted companion asks for help but withholds the most important fact."
+  },
+  {
+    "family": "memory",
+    "prompt_id": "prompt:memory:01",
+    "required_keywords": [
+      "object",
+      "memory",
+      "narrator",
+      "untouched"
+    ],
+    "text": "Write a reflective scene in which an ordinary object brings back a memory the narrator would rather leave untouched."
+  },
+  {
+    "family": "memory",
+    "prompt_id": "prompt:memory:02",
+    "required_keywords": [
+      "character",
+      "recalls",
+      "promise",
+      "differently"
+    ],
+    "text": "Write a scene in which a character recalls an earlier promise and begins to understand it differently."
+  },
+  {
+    "family": "mystery",
+    "prompt_id": "prompt:mystery:01",
+    "required_keywords": [
+      "inconsistency",
+      "suspect",
+      "truth",
+      "hidden"
+    ],
+    "text": "Write a scene in which a small inconsistency leads a character to suspect that an important truth has been hidden."
+  },
+  {
+    "family": "mystery",
+    "prompt_id": "prompt:mystery:02",
+    "required_keywords": [
+      "letter",
+      "message",
+      "alarms",
+      "recipient"
+    ],
+    "text": "Write a scene in which a letter or message is received and its tone alarms the recipient before its meaning is fully clear."
+  },
+  {
+    "family": "setting",
+    "prompt_id": "prompt:setting:01",
+    "required_keywords": [
+      "setting",
+      "reveals",
+      "emotional",
+      "person"
+    ],
+    "text": "Write a scene in which the physical setting gradually reveals the emotional state of the person moving through it."
+  },
+  {
+    "family": "setting",
+    "prompt_id": "prompt:setting:02",
+    "required_keywords": [
+      "descriptive",
+      "weather",
+      "landscape",
+      "decision"
+    ],
+    "text": "Write a descriptive scene in which weather or landscape changes the course of a human decision."
+  },
+  {
+    "family": "social_conflict",
+    "prompt_id": "prompt:social_conflict:01",
+    "required_keywords": [
+      "public",
+      "social",
+      "embarrassment",
+      "custom"
+    ],
+    "text": "Write a public social scene in which embarrassment spreads because one person fails to follow an expected custom."
+  },
+  {
+    "family": "social_conflict",
+    "prompt_id": "prompt:social_conflict:02",
+    "required_keywords": [
+      "conversation",
+      "duty",
+      "argument",
+      "power"
+    ],
+    "text": "Write a scene in which a conversation about manners or duty becomes a disguised argument about power."
+  },
+  {
+    "family": "travel",
+    "prompt_id": "prompt:travel:01",
+    "required_keywords": [
+      "arrival",
+      "unfamiliar",
+      "traveler",
+      "notice"
+    ],
+    "text": "Write a scene of arrival in an unfamiliar place where the traveler first notices something that does not fit the expected order of things."
+  },
+  {
+    "family": "travel",
+    "prompt_id": "prompt:travel:02",
+    "required_keywords": [
+      "journey",
+      "delay",
+      "observe",
+      "characters"
+    ],
+    "text": "Write a journey scene in which a delay forces the characters to observe one another more closely than they intended."
+  }
+]

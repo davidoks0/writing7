@@ -1,0 +1,22 @@
+{
+  "acquisition_mode": "rsync",
+  "builder_seed": 42,
+  "output_root": "/corpus",
+  "min_clean_words": 40000,
+  "min_clean_sentences": 1500,
+  "min_author_books": 3,
+  "benchmark_split_requires_author_track": true,
+  "alpha_char_ratio_min": 0.7,
+  "raw_scan_roots": [
+    "raw/gutenberg/http",
+    "raw/gutenberg/rsync"
+  ],
+  "passage_policy": {
+    "min_words": 150,
+    "max_words": 300,
+    "preferred_words": 220,
+    "min_sentences": 6,
+    "max_sentences": 18,
+    "region_buckets": 5
+  }
+}

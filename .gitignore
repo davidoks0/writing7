@@ -1,0 +1,33 @@
+# Local Python environments
+.venv/
+venv/
+ENV/
+
+# Python caches and test outputs
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+
+# Local environment files
+.env
+.env.*
+.envrc
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local Modal metadata
+.modal/
+
+# Logs
+*.log

@@ -70,28 +70,25 @@ A compliant implementation of this spec MUST provide:
    - calls a text-generation model
    - scores style against held-out targets
    - scores against distractors
-   - runs originality and prompt-adherence checks
+   - runs originality and fluency checks
    - emits per-sample JSONL results
 6. An aggregate report generator with confidence intervals.
-7. A small human-eval validation path for checking whether automatic metrics align with human judgments.
-8. A smoke-test path that works without external APIs by using stub generators and tiny local fixtures.
+7. A smoke-test path that works without external APIs by using stub generators and tiny local fixtures.
 
 
 ## Benchmark Definition
 
 The benchmark construct is:
 
-`style mimicry quality = style fidelity on novel content under originality and task-compliance constraints`
+`style mimicry quality = style fidelity on novel content under originality and basic fluency constraints`
 
-This decomposes into four measured components:
+This decomposes into three measured components:
 
 1. `Style fidelity`
    The output should resemble the target author or target book more than matched distractors.
 2. `Originality`
    The output should not be a near-copy, stitched paraphrase, or named-entity transplant from the references.
-3. `Prompt adherence`
-   The output should actually address the requested scenario.
-4. `Basic fluency`
+3. `Basic fluency`
    The output should be long enough and readable enough to evaluate.
 
 The benchmark MUST report these components separately. A single scalar MAY be published later, but only as a derived view, never as the only score.
@@ -122,7 +119,6 @@ The current benchmark remains a proxy because:
 - it scores generations against the same excerpt used for prompting
 - it does not enforce held-out evaluation passages
 - it does not compute a real anti-copy metric
-- it does not compute a canonical prompt-adherence metric
 - it mixes same-book discrimination and author-style affinity in ways that make score interpretation unstable
 
 This document defines the replacement target.
@@ -137,7 +133,7 @@ The benchmark MUST follow these principles:
 2. `Disjointness`
    Benchmark authors MUST be disjoint from style-scorer training authors for the canonical benchmark.
 3. `Multi-axis measurement`
-   Style, originality, prompt adherence, and fluency MUST be measured separately.
+   Style, originality, and fluency MUST be measured separately.
 4. `Matched distractors`
    The target MUST compete against plausible distractors, not only random negatives.
 5. `Determinism`
@@ -204,13 +200,8 @@ writing7/
 │   ├── distractors.py                      # Distractor selection logic
 │   ├── style_scoring.py                    # Target-vs-distractor scoring primitives
 │   ├── originality.py                      # Copy detection metrics
-│   ├── prompt_adherence.py                 # Deterministic prompt adherence metrics
 │   ├── fluency.py                          # Readability / malformed / repetition checks
 │   ├── llm_clients.py                      # Existing generator adapters
-│   ├── human_eval/
-│   │   ├── README.md
-│   │   ├── build_human_eval_packets.py
-│   │   └── validate_auto_metrics.py
 │   └── benchmark_data/
 │       ├── VERSION
 │       ├── config_v1.json
@@ -237,7 +228,6 @@ writing7/
 │   ├── test_benchmark_schema.py
 │   ├── test_passage_sampling.py
 │   ├── test_originality.py
-│   ├── test_prompt_adherence.py
 │   ├── test_distractors.py
 │   ├── test_benchmark_runner_smoke.py
 │   └── test_aggregate_benchmark_results.py
@@ -388,7 +378,6 @@ Each prompt record MUST include:
   "prompt_id": "prompt:interpersonal:01",
   "family": "interpersonal",
   "text": "Write a scene in which two people who know each other well speak politely while both conceal a serious grievance.",
-  "required_keywords": ["two people", "conceal", "grievance"],
   "preferred_pov": "any",
   "dialogue_expected": true,
   "target_word_range": [500, 800]
@@ -401,7 +390,6 @@ Required fields:
 - `text`
 
 Recommended fields:
-- `required_keywords`
 - `preferred_pov`
 - `dialogue_expected`
 - `target_word_range`
@@ -545,12 +533,6 @@ Example:
     "copy_score": 0.14,
     "copy_flag": false
   },
-  "prompt_metrics": {
-    "semantic_similarity_0_1": 0.63,
-    "keyword_coverage": 0.67,
-    "prompt_score": 0.64,
-    "prompt_pass": true
-  },
   "fluency_metrics": {
     "word_count": 641,
     "repetition_rate_6gram": 0.03,
@@ -560,7 +542,6 @@ Example:
   },
   "valid_flags": {
     "originality_pass": true,
-    "prompt_pass": true,
     "fluency_pass": true,
     "valid": true
   }
@@ -603,12 +584,6 @@ Example:
     "token_lcs_ratio_max": 0.20,
     "joint_char_overlap_threshold": 0.20,
     "joint_lcs_threshold": 0.15
-  },
-  "prompt_adherence": {
-    "encoder_model_id": "local_prompt_encoder_v1",
-    "semantic_weight": 0.85,
-    "keyword_weight": 0.15,
-    "prompt_pass_threshold": 0.45
   },
   "fluency_thresholds": {
     "min_words_valid": 350,
@@ -928,98 +903,82 @@ This list is sufficient for a first compliant implementation.
   {
     "prompt_id": "prompt:interpersonal:01",
     "family": "interpersonal",
-    "text": "Write a scene in which two people who know each other well speak politely while both conceal a serious grievance.",
-    "required_keywords": ["two", "people", "conceal", "grievance"]
+    "text": "Write a scene in which two people who know each other well speak politely while both conceal a serious grievance."
   },
   {
     "prompt_id": "prompt:interpersonal:02",
     "family": "interpersonal",
-    "text": "Write a scene in which a trusted companion asks for help but withholds the most important fact.",
-    "required_keywords": ["companion", "help", "withholds", "fact"]
+    "text": "Write a scene in which a trusted companion asks for help but withholds the most important fact."
   },
   {
     "prompt_id": "prompt:travel:01",
     "family": "travel",
-    "text": "Write a scene of arrival in an unfamiliar place where the traveler first notices something that does not fit the expected order of things.",
-    "required_keywords": ["arrival", "unfamiliar", "traveler", "notice"]
+    "text": "Write a scene of arrival in an unfamiliar place where the traveler first notices something that does not fit the expected order of things."
   },
   {
     "prompt_id": "prompt:travel:02",
     "family": "travel",
-    "text": "Write a journey scene in which a delay forces the characters to observe one another more closely than they intended.",
-    "required_keywords": ["journey", "delay", "observe", "characters"]
+    "text": "Write a journey scene in which a delay forces the characters to observe one another more closely than they intended."
   },
   {
     "prompt_id": "prompt:memory:01",
     "family": "memory",
-    "text": "Write a reflective scene in which an ordinary object brings back a memory the narrator would rather leave untouched.",
-    "required_keywords": ["object", "memory", "narrator", "untouched"]
+    "text": "Write a reflective scene in which an ordinary object brings back a memory the narrator would rather leave untouched."
   },
   {
     "prompt_id": "prompt:memory:02",
     "family": "memory",
-    "text": "Write a scene in which a character recalls an earlier promise and begins to understand it differently.",
-    "required_keywords": ["character", "recalls", "promise", "differently"]
+    "text": "Write a scene in which a character recalls an earlier promise and begins to understand it differently."
   },
   {
     "prompt_id": "prompt:mystery:01",
     "family": "mystery",
-    "text": "Write a scene in which a small inconsistency leads a character to suspect that an important truth has been hidden.",
-    "required_keywords": ["inconsistency", "suspect", "truth", "hidden"]
+    "text": "Write a scene in which a small inconsistency leads a character to suspect that an important truth has been hidden."
   },
   {
     "prompt_id": "prompt:mystery:02",
     "family": "mystery",
-    "text": "Write a scene in which a letter or message is received and its tone alarms the recipient before its meaning is fully clear.",
-    "required_keywords": ["letter", "message", "alarms", "recipient"]
+    "text": "Write a scene in which a letter or message is received and its tone alarms the recipient before its meaning is fully clear."
   },
   {
     "prompt_id": "prompt:social_conflict:01",
     "family": "social_conflict",
-    "text": "Write a public social scene in which embarrassment spreads because one person fails to follow an expected custom.",
-    "required_keywords": ["public", "social", "embarrassment", "custom"]
+    "text": "Write a public social scene in which embarrassment spreads because one person fails to follow an expected custom."
   },
   {
     "prompt_id": "prompt:social_conflict:02",
     "family": "social_conflict",
-    "text": "Write a scene in which a conversation about manners or duty becomes a disguised argument about power.",
-    "required_keywords": ["conversation", "duty", "argument", "power"]
+    "text": "Write a scene in which a conversation about manners or duty becomes a disguised argument about power."
   },
   {
     "prompt_id": "prompt:setting:01",
     "family": "setting",
-    "text": "Write a scene in which the physical setting gradually reveals the emotional state of the person moving through it.",
-    "required_keywords": ["setting", "reveals", "emotional", "person"]
+    "text": "Write a scene in which the physical setting gradually reveals the emotional state of the person moving through it."
   },
   {
     "prompt_id": "prompt:setting:02",
     "family": "setting",
-    "text": "Write a descriptive scene in which weather or landscape changes the course of a human decision.",
-    "required_keywords": ["descriptive", "weather", "landscape", "decision"]
+    "text": "Write a descriptive scene in which weather or landscape changes the course of a human decision."
   },
   {
     "prompt_id": "prompt:domestic_tension:01",
     "family": "domestic_tension",
-    "text": "Write a domestic scene in which a routine task is interrupted by news that no one is ready to discuss plainly.",
-    "required_keywords": ["domestic", "routine", "news", "discuss"]
+    "text": "Write a domestic scene in which a routine task is interrupted by news that no one is ready to discuss plainly."
   },
   {
     "prompt_id": "prompt:domestic_tension:02",
     "family": "domestic_tension",
-    "text": "Write a household scene in which a minor disagreement exposes a much larger unease.",
-    "required_keywords": ["household", "disagreement", "larger", "unease"]
+    "text": "Write a household scene in which a minor disagreement exposes a much larger unease."
   },
   {
     "prompt_id": "prompt:ambition_failure:01",
     "family": "ambition_failure",
-    "text": "Write a scene in which a character must decide whether to persist in a plan that is clearly beginning to fail.",
-    "required_keywords": ["character", "decide", "plan", "fail"]
+    "text": "Write a scene in which a character must decide whether to persist in a plan that is clearly beginning to fail."
   },
   {
     "prompt_id": "prompt:ambition_failure:02",
     "family": "ambition_failure",
-    "text": "Write a scene in which a person receives an opportunity that appears favorable but carries an unspoken cost.",
-    "required_keywords": ["opportunity", "favorable", "cost", "unspoken"]
+    "text": "Write a scene in which a person receives an opportunity that appears favorable but carries an unspoken cost."
   }
 ]
 ```
@@ -1232,45 +1191,6 @@ Recommended v1 originality pass:
 Thresholds SHOULD be validated on the human dev set and stored in benchmark config, not scattered through the codebase.
 
 
-## Prompt Adherence Metrics
-
-The canonical benchmark MUST use a deterministic prompt-adherence metric.
-
-It MAY additionally use an LLM judge for audits, but the official score MUST come from a frozen local metric.
-
-### Required Inputs
-
-Each prompt SHOULD provide:
-- prompt text
-- optional `required_keywords`
-
-### Canonical v1 Prompt Metric
-
-The benchmark SHOULD compute:
-
-1. `semantic_similarity_0_1`
-   - cosine similarity between frozen prompt-encoder embeddings for prompt text and output text
-   - mapped to `0..1`
-
-2. `keyword_coverage`
-   - fraction of `required_keywords` whose lowercase forms appear in the normalized output
-   - if the prompt has no `required_keywords`, set this to `1.0`
-
-3. `prompt_score`
-
-Recommended formula:
-
-`prompt_score = 0.85 * semantic_similarity_0_1 + 0.15 * keyword_coverage`
-
-4. `prompt_pass`
-
-Recommended default:
-
-`prompt_pass = prompt_score >= 0.45`
-
-The prompt encoder model ID MUST be versioned in benchmark config.
-
-
 ## Fluency And Readability Metrics
 
 The benchmark SHOULD keep these lightweight and deterministic.
@@ -1292,7 +1212,6 @@ Required v1 checks:
 
 A sample is `valid` only if all of the following are true:
 - `originality_pass`
-- `prompt_pass`
 - `fluency_pass`
 
 The benchmark MUST report style metrics:
@@ -1307,7 +1226,6 @@ The recommended headline metric tuple for public reporting is:
 - `mean_style_margin_valid`
 - `top1_target_accuracy_valid`
 - `originality_pass_rate`
-- `prompt_pass_rate`
 - `valid_rate`
 
 The benchmark SHOULD also report:
@@ -1456,23 +1374,6 @@ Required behavior:
 - compute per-target breakdowns
 - compute bootstrap confidence intervals
 
-### 4. Build Human-Eval Packets
-
-```bash
-python -m eval.human_eval.build_human_eval_packets \
-  --input results/author_dev_multiple_models.jsonl \
-  --out eval/human_eval/dev_packets_v1.jsonl
-```
-
-### 5. Validate Automatic Metrics
-
-```bash
-python -m eval.human_eval.validate_auto_metrics \
-  --human-annotations eval/human_eval/annotations_v1.jsonl \
-  --benchmark-results results/author_dev_multiple_models.jsonl
-```
-
-
 ## Public Module Contracts
 
 The following module responsibilities SHOULD be explicit.
@@ -1510,13 +1411,6 @@ Must define:
 - char n-gram overlap
 - token LCS ratio
 - copy flag logic
-
-### `eval/prompt_adherence.py`
-
-Must define:
-- frozen local prompt encoder adapter
-- keyword coverage
-- prompt score formula
 
 ### `eval/fluency.py`
 
@@ -1561,7 +1455,6 @@ The aggregate summary JSON SHOULD include:
     "top1_target_accuracy_mean": 0.56,
     "mrr_mean": 0.73,
     "originality_pass_rate": 0.91,
-    "prompt_pass_rate": 0.88,
     "valid_rate": 0.84
   },
   "metrics_valid": {
@@ -1616,46 +1509,6 @@ Suggested format:
 
 Documentation-only edits SHOULD NOT change the benchmark version.
 
-
-## Human Evaluation
-
-Human evaluation is required for validating the automatic metric stack, even if it is not required for every model run.
-
-### Human Dev Set
-
-The implementation SHOULD build a human-eval packet from benchmark-dev outputs.
-
-Recommended protocol:
-- show annotators the conditioning passages
-- show the content prompt
-- show two model outputs in blinded order
-- ask which output better matches the target style
-- ask whether either output appears copied
-- ask whether each output addresses the prompt
-
-### Human Annotation Schema
-
-Each annotation row SHOULD include:
-- `pair_id`
-- `case_id`
-- `output_a_model`
-- `output_b_model`
-- `preferred_style_output`
-- `copy_suspected_a`
-- `copy_suspected_b`
-- `prompt_pass_a`
-- `prompt_pass_b`
-
-### Validation Goal
-
-Before the benchmark is described as mature, automatic style ranking SHOULD show a reasonably strong correlation with human pairwise style judgments on benchmark-dev.
-
-At minimum, the repo SHOULD be able to report:
-- pairwise agreement rate between automatic rank and human preference
-- rank correlation where applicable
-- false-positive rate of copy detection on human-judged non-copies
-
-
 ## Testing And Acceptance
 
 The benchmark repo MUST include tests.
@@ -1670,14 +1523,12 @@ The benchmark repo MUST include tests.
 3. `test_originality.py`
    - exact copies are flagged
    - clearly novel text is not flagged
-4. `test_prompt_adherence.py`
-   - obviously off-prompt output scores below clearly on-prompt output
-5. `test_distractors.py`
+4. `test_distractors.py`
    - distractor selection excludes target
    - distractor counts and metadata constraints hold
-6. `test_benchmark_runner_smoke.py`
+5. `test_benchmark_runner_smoke.py`
    - runner can execute a tiny fixture set with a stub generator and stub scorer
-7. `test_aggregate_benchmark_results.py`
+6. `test_aggregate_benchmark_results.py`
    - aggregation computes stable means and CI output structure
 
 ### Required Smoke Test
@@ -1698,10 +1549,8 @@ The benchmark SHOULD be described as "ready" only if all are true:
 1. scorer-train authors are disjoint from benchmark authors
 2. conditioning and evaluation passages are disjoint
 3. originality checks are implemented and enforced
-4. prompt adherence is implemented and enforced
-5. aggregate reports include confidence intervals
-6. automatic metrics have been checked against a human dev set
-7. the current proxy benchmark is no longer presented as the canonical benchmark
+4. aggregate reports include confidence intervals
+5. the current proxy benchmark is no longer presented as the canonical benchmark
 
 
 ## Migration Plan From The Current Repo
@@ -1992,38 +1841,6 @@ Required behaviors:
 - `stub:fixed_prose` returns a deterministic fixed paragraph
 
 
-## Exact Prompt-Adherence Contract
-
-For canonical `gutenberg_style_v1`, the prompt encoder is no longer implementation-defined.
-
-### Frozen Encoder
-
-The benchmark MUST use:
-
-- `sentence-transformers/all-MiniLM-L6-v2`
-
-Embedding rule:
-- mean-pool the final token embeddings with attention-mask weighting
-- L2-normalize
-- compute cosine similarity
-- map to `[0, 1]` with `(cosine + 1) / 2`
-
-### Keyword Coverage
-
-Keyword matching MUST:
-- lowercase both prompt keywords and output text
-- collapse whitespace to single spaces
-- treat a keyword as covered if its normalized substring appears in the normalized output
-
-### Prompt Score
-
-The canonical formula is:
-
-`prompt_score = 0.85 * semantic_similarity_0_1 + 0.15 * keyword_coverage`
-
-`prompt_pass = prompt_score >= 0.45`
-
-
 ## Exact Originality Contract
 
 For canonical `gutenberg_style_v1`, the LCS implementation is no longer open.
@@ -2144,94 +1961,6 @@ The artifact MUST be built from `benchmark_dev` targets only:
 `style_percentile_case` MUST be computed against `global.target_similarity`.
 
 
-## Exact Human-Eval Packet Contract
-
-The human-eval builder MUST create packets only from `benchmark_dev` results.
-
-### Representative Sample Selection
-
-For each `(case_id, model)`:
-
-1. Prefer valid outputs.
-2. Rank outputs by:
-   - `style_margin_case` descending
-   - then `prompt_score` descending
-   - then `sample_index` ascending
-3. Take the first ranked output as the representative sample.
-
-### Packet Enumeration
-
-For each `case_id`:
-
-1. Collect representative samples from all models.
-2. Enumerate all unordered model pairs.
-3. Rank model pairs by absolute difference in automatic `style_margin_case` descending.
-4. Keep at most `3` model pairs per case.
-5. For each selected pair, derive:
-
-`packet_seed = int(sha256(f"{benchmark_version}|{case_id}|{model_a}|{model_b}").hexdigest()[:8], 16)`
-
-6. If `packet_seed` is even, keep model ordering as `(A, B)`. If odd, swap to `(B, A)`.
-
-### Packet Schema
-
-```json
-{
-  "packet_id": "packet:gutenberg_style_v1:author:case123:modelA:modelB",
-  "benchmark_version": "gutenberg_style_v1",
-  "track": "author",
-  "case_id": "case:author:dev:jane_austen:interpersonal_01",
-  "prompt_id": "prompt:interpersonal:01",
-  "prompt_text": "Write a scene in which two people...",
-  "conditioning_texts": ["...", "...", "..."],
-  "output_a": {
-    "model_name": "openai:gpt-4o-mini",
-    "sample_id": "run:...:case123:0",
-    "text": "..."
-  },
-  "output_b": {
-    "model_name": "anthropic:claude-3-5-sonnet",
-    "sample_id": "run:...:case123:0",
-    "text": "..."
-  }
-}
-```
-
-### Annotation Schema
-
-```json
-{
-  "annotation_id": "annotation:packet123:annotator01",
-  "packet_id": "packet:gutenberg_style_v1:author:case123:modelA:modelB",
-  "annotator_id": "annotator01",
-  "preferred_style_output": "A",
-  "copy_suspected_a": false,
-  "copy_suspected_b": false,
-  "prompt_pass_a": true,
-  "prompt_pass_b": true,
-  "notes": ""
-}
-```
-
-### Validation Aggregation Rules
-
-The validator MUST:
-
-1. Group annotations by `packet_id`.
-2. Compute majority vote separately for:
-   - `preferred_style_output`
-   - `copy_suspected_a`
-   - `copy_suspected_b`
-   - `prompt_pass_a`
-   - `prompt_pass_b`
-3. Treat ties as unresolved and exclude them from agreement metrics.
-4. Define the automatic winner as the representative sample with larger `style_margin_case`.
-5. Report:
-   - `pairwise_style_agreement = mean(automatic_winner == human_majority_winner)`
-   - `copy_false_positive_rate = fraction of outputs with auto copy_flag = true among human-majority non-copies`
-   - `prompt_false_negative_rate = fraction of outputs with auto prompt_pass = false among human-majority prompt passes`
-
-
 ## Exact Aggregation Contract
 
 The aggregate report MUST bootstrap over `case_id`, not individual samples.
@@ -2252,7 +1981,6 @@ Algorithm:
 
 For `gutenberg_style_v1`, these choices are fixed:
 - passage text MUST be stored inline in passage JSONL records
-- prompt encoder MUST be `sentence-transformers/all-MiniLM-L6-v2`
 - hard distractor profiles MUST use mean-pooled conditioning-passage embeddings
 - token LCS MUST be exact dynamic programming
 
@@ -2265,7 +1993,7 @@ If building from this spec in the current repo, the next concrete work SHOULD be
 2. Create `eval/passage_sampling.py`.
 3. Create `eval/build_benchmark_manifests.py`.
 4. Materialize `eval/benchmark_data/prompts_v1.json`.
-5. Create `eval/style_scoring.py`, `eval/originality.py`, `eval/prompt_adherence.py`, and `eval/fluency.py`.
+5. Create `eval/style_scoring.py`, `eval/originality.py`, and `eval/fluency.py`.
 6. Create `eval/benchmark_v2.py`.
 7. Create `eval/aggregate_benchmark_results.py`.
 8. Add the smoke tests under `tests/`.
