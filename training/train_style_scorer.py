@@ -557,15 +557,19 @@ def _train_transformer_scorer(config: dict[str, Any]) -> dict[str, str]:
 def train_style_scorer(config_path_or_payload: str | Path | dict[str, Any]) -> dict[str, str]:
     config = _load_config(config_path_or_payload)
     backend = config.get("training_backend")
-    inferred_backend = backend is None
-    if backend is None:
-        backend = "transformer" if AutoTokenizer is not None and torch is not None else "bow"
     if backend == "bow":
-        return _train_bow_scorer(config)
-    if not inferred_backend:
+        bow_config = dict(config)
+        bow_config["training_backend"] = "bow"
+        return _train_bow_scorer(bow_config)
+    if backend == "transformer":
         return _train_transformer_scorer(config)
+    if backend is not None:
+        raise ValueError(f"unsupported training_backend: {backend}")
+
+    transformer_config = dict(config)
+    transformer_config["training_backend"] = "transformer"
     try:
-        return _train_transformer_scorer(config)
+        return _train_transformer_scorer(transformer_config)
     except (ImportError, OSError) as exc:
         fallback_config = dict(config)
         fallback_config["training_backend"] = "bow"
